@@ -108,7 +108,8 @@ export async function onRequestPost(context) {
       return json({ error: 'API Error: ' + errMsg }, 502);
     }
 
-    const rawText = data.content[0].text.trim();
+    const textBlock = (data.content || []).find(function(b){ return b.type === 'text'; });
+    const rawText = (textBlock && textBlock.text ? textBlock.text : '').trim();
     const jsonMatch = rawText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return json({ error: 'รูปแบบผลไม่ถูกต้อง' }, 500);
 

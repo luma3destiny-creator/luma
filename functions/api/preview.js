@@ -75,7 +75,7 @@ export async function onRequestPost(context) {
     }
 
     const claudeData = await claudeRes.json();
-    const preview = claudeData.content[0].text;
+    const preview = ((claudeData.content || []).find(function(b){ return b.type === 'text'; }) || {}).text || '';
     return json({ preview });
   } catch (e) {
     return json({ error: 'เกิดข้อผิดพลาด กรุณาลองใหม่' }, 502);

@@ -82,7 +82,8 @@ export async function onRequestPost(context) {
       return json({ error: 'AI ไม่สามารถสร้างผลได้ กรุณาลองใหม่' }, 502);
     }
 
-    const rawText = data.content[0].text.trim();
+    const textBlock = (data.content || []).find(function(b){ return b.type === 'text'; });
+    const rawText = (textBlock && textBlock.text ? textBlock.text : '').trim();
     const jsonMatch = rawText.match(/\{[\s\S]*"spirit"[\s\S]*\}/);
     if (!jsonMatch) {
       console.error('No JSON in response:', rawText.slice(0, 300));

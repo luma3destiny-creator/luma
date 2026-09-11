@@ -137,7 +137,7 @@ export async function onRequestPost(context) {
     }
 
     const claudeData = await claudeRes.json();
-    reading = claudeData.content[0].text;
+    reading = ((claudeData.content || []).find(function(b){ return b.type === 'text'; }) || {}).text || '';
   } catch (e) {
     return json({ error: 'เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่' }, 502);
   }
