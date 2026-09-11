@@ -71,6 +71,7 @@ export async function onRequestPost(context) {
       body: JSON.stringify({
         model: 'claude-sonnet-5',
         max_tokens: 2500,
+        thinking: { type: 'disabled' },
         messages: [{ role: 'user', content: prompt }]
       })
     });
@@ -86,12 +87,8 @@ export async function onRequestPost(context) {
     const rawText = (textBlock && textBlock.text ? textBlock.text : '').trim();
     const jsonMatch = rawText.match(/\{[\s\S]*"spirit"[\s\S]*\}/);
     if (!jsonMatch) {
-      console.error('No JSON in response. Full API response:', JSON.stringify(data).slice(0, 1500));
-      return json({
-        error: 'รูปแบบผลไม่ถูกต้อง',
-        debug: rawText.slice(0, 300),
-        apiShape: JSON.stringify(data).slice(0, 800)
-      }, 500);
+      console.error('No JSON in response:', rawText.slice(0, 300));
+      return json({ error: 'รูปแบบผลไม่ถูกต้อง' }, 500);
     }
 
     let reading;
@@ -106,7 +103,7 @@ export async function onRequestPost(context) {
 
   } catch (e) {
     console.error('Generate reading failed:', e);
-    return json({ error: 'เกิดข้อผิดพลาด กรุณาลองใหม่', debug: String(e && e.message ? e.message : e) }, 500);
+    return json({ error: 'เกิดข้อผิดพลาด กรุณาลองใหม่' }, 500);
   }
 }
 

@@ -111,6 +111,7 @@ export async function onRequestPost(context) {
       body: JSON.stringify({
         model: 'claude-opus-5',
         max_tokens: 2000,
+        thinking: { type: 'disabled' },
         messages: [{ role: 'user', content: prompt }]
       })
     });

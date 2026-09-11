@@ -91,6 +91,7 @@ export async function onRequestPost(context) {
       body: JSON.stringify({
         model: 'claude-sonnet-5',
         max_tokens: 3000,
+        thinking: { type: 'disabled' },
         messages: [{
           role: 'user',
           content: [
