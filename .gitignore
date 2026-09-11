@@ -1,0 +1,11 @@
+# Local Netlify folder
+.netlify
+
+# Local wrangler cache
+.wrangler
+
+# Scratch / content-planning folders not part of the deployed site
+Claude outputs/
+outputs/
+_to_delete/
+Luma API GPT.txt

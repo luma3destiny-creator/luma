@@ -1,0 +1,10 @@
+# Not part of the deployed site — content-planning/scratch folders that
+# shouldn't be uploaded as static assets (Post/ has files over Cloudflare's
+# 25 MiB per-file limit and doesn't need to be public anyway).
+Post/
+Claude outputs/
+_to_delete/
+netlify/
+.netlify/
+outputs/
+index.source.html
