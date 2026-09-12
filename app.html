@@ -177,7 +177,7 @@ window.onPaidClick=async function(){
 };
 function renderExpiryBanner(exDate){
   var exStr=exDate.toLocaleDateString('th-TH',{year:'numeric',month:'long',day:'numeric'});
-  var daysLeft=Math.ceil((exDate.getTime()-Date.now())/86400000);
+  var now=new Date();var d1=new Date(now.getFullYear(),now.getMonth(),now.getDate());var d2=new Date(exDate.getFullYear(),exDate.getMonth(),exDate.getDate());var daysLeft=Math.round((d2-d1)/86400000);
   var exBanner=document.getElementById("expiryBanner");
   if(!exBanner)return;
   exBanner.style.display="block";
