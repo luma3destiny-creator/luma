@@ -86,6 +86,8 @@ export async function onRequestPost(context) {
   const p1animal = person1.animal || '';
   const p2animal = person2.animal || '';
 
+  const SUMMARY_MARKER = '===SUMMARY_JSON===';
+
   const prompt = `คุณเป็นนักโหราศาสตร์ผู้เชี่ยวชาญ วิเคราะห์ความเข้ากันระหว่างสองคนนี้
 
 ข้อมูลที่ผ่านการคำนวณและยืนยันแล้ว ห้ามคำนวณหรือเปลี่ยนแปลงใดๆ:
@@ -108,8 +110,11 @@ export async function onRequestPost(context) {
 1. ห้ามพูดถึงชื่อศาสตร์หรือคำศัพท์เฉพาะทางใดๆ เช่น ราศี, ธาตุ, ลัคนา, นักษัตร, ดาวอังคาร, ดาวพุธ, Mercury, Mars, BaZi ฯลฯ — ให้แปลงเป็นคำอธิบายบุคลิกและชีวิตจริงที่คนทั่วไปเข้าใจทันที
 2. ใช้คำว่า "คุณ" ตลอด ห้ามใช้ "ท่าน" เด็ดขาด ใช้ชื่อจริงของทั้งสองคน ห้ามใช้ "คนที่ 1" "คนที่ 2"
 3. พูดถึงชีวิตจริงๆ ว่าทั้งคู่อยู่ด้วยกันแล้วเป็นอย่างไร เข้ากันในเรื่องอะไร ขัดกันตรงไหน และควรทำอย่างไรให้ความสัมพันธ์ดีขึ้น
-4. พูดตรงๆ ทั้งดีและไม่ดี ห้ามประจบหรือทำให้ดูดีเกินจริง
+4. พูดตรงๆ ทั้งดีและไม่ดี ห้ามประจบหรือทำให้ดูดีเกินจริง และห้ามเขียนคำทำนายเชิงลบเกินจริงเพื่อกระตุ้นให้ซื้อบริการเพิ่มเติม
 5. แต่ละหัวข้อเขียน 3-4 ประโยคเต็มๆ ให้จบความ
+6. ห้ามใช้คะแนนความเข้ากัน (compatibility score) หรือเนื้อหาส่วนนี้เป็นข้อสรุปฟันธงว่าควรคบหรือเลิกกัน ให้เป็นข้อมูลประกอบการตัดสินใจของทั้งคู่เองเท่านั้น
+7. ห้ามระบุชื่อโรค อวัยวะที่มีปัญหา อาการเจ็บป่วย หรือความเสี่ยงด้านสุขภาพของฝ่ายใดฝ่ายหนึ่งโดยเด็ดขาด
+8. ห้ามแต่งข้อมูลส่วนตัวของทั้งสองคนที่ไม่ได้ให้มา (เช่น อาชีพ ครอบครัว ประวัติ)
 
 แบ่งเป็น 4 ส่วน แต่ละส่วนขึ้นต้นด้วยชื่อหัวข้อตามด้วยเครื่องหมายทวิภาค จากนั้นขึ้นบรรทัดใหม่เขียนเนื้อหา 3-4 ประโยค แล้วเว้น 1 บรรทัดก่อนหัวข้อถัดไป
 
@@ -119,9 +124,14 @@ export async function onRequestPost(context) {
 จุดแข็งของคู่นี้: เขียนสิ่งที่ทำให้คู่นี้พิเศษและแข็งแกร่ง สิ่งที่ทำได้ดีเมื่ออยู่ด้วยกัน
 สิ่งที่ต้องระวังและคำแนะนำ: เขียนจุดที่อาจเกิดปัญหาและวิธีแก้ที่ทำได้จริง
 
-ห้ามใช้เครื่องหมาย # หรือ * หรือ - เด็ดขาด ใช้ตัวอักษรธรรมดาเท่านั้น`;
+ห้ามใช้เครื่องหมาย # หรือ * หรือ - เด็ดขาด ใช้ตัวอักษรธรรมดาเท่านั้น
 
-  let reading;
+หลังจากเขียนครบ 4 หัวข้อแล้ว ให้ขึ้นบรรทัดใหม่ พิมพ์ข้อความนี้ตรงตัว (ไม่ต้องมีอะไรอื่นในบรรทัดนั้น):
+${SUMMARY_MARKER}
+จากนั้นในบรรทัดถัดไป เขียน JSON บรรทัดเดียว (ห้ามขึ้นบรรทัดใหม่ในค่า ห้ามมีข้อความอื่นปนอยู่) สรุปจากเนื้อหา 4 หัวข้อข้างต้นเท่านั้น ห้ามเพิ่มข้อมูลใหม่ ประโยคละไม่เกิน 20 คำ ตามรูปแบบนี้:
+{"highlight":"จุดเด่นที่สุดของความสัมพันธ์คู่นี้","watch":"เรื่องที่ทั้งคู่ควรพูดคุยหรือระวังมากที่สุด","action":"สิ่งที่ทำได้จริงหนึ่งอย่างที่ทั้งคู่ควรลองทำด้วยกัน"}`;
+
+  let reading, summary = null;
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -132,7 +142,7 @@ export async function onRequestPost(context) {
       },
       body: JSON.stringify({
         model: 'claude-opus-5',
-        max_tokens: 2000,
+        max_tokens: 2200,
         thinking: { type: 'disabled' },
         messages: [{ role: 'user', content: prompt }]
       })
@@ -143,12 +153,29 @@ export async function onRequestPost(context) {
     }
 
     const claudeData = await claudeRes.json();
-    reading = ((claudeData.content || []).find(function(b){ return b.type === 'text'; }) || {}).text || '';
+    const rawText = ((claudeData.content || []).find(function(b){ return b.type === 'text'; }) || {}).text || '';
+
+    const markerIdx = rawText.indexOf(SUMMARY_MARKER);
+    if (markerIdx === -1) {
+      reading = rawText.trim();
+    } else {
+      reading = rawText.slice(0, markerIdx).trim();
+      const summaryPart = rawText.slice(markerIdx + SUMMARY_MARKER.length).trim();
+      const summaryMatch = summaryPart.match(/\{[\s\S]*\}/);
+      if (summaryMatch) {
+        try {
+          const parsed = JSON.parse(summaryMatch[0]);
+          if (parsed && typeof parsed === 'object') summary = parsed;
+        } catch (e) {
+          console.warn('compat summary JSON parse failed:', e.message);
+        }
+      }
+    }
   } catch (e) {
     return json({ error: 'เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่' }, 502);
   }
 
-  return json({ reading });
+  return json({ reading, summary });
 }
 
 function json(data, status = 200) {
