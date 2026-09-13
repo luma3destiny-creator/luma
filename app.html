@@ -112,6 +112,8 @@
 <div id="payModal" class="pay-overlay" style="display:none"><div class="pay-box"><button class="pay-close" onclick='closePayModal()'>✕</button><div class="pay-title">ปลดล็อค Premium โดย LUMA</div><div class="pay-subtitle">ปฏิทินวันดี · สีมงคล · ฤกษ์กิจการ · ดูดวงคู่ · โหงวเฮ้ง · ลายมือ</div>
 <!-- step 1: phone -->
 <div id="payStep1"><div class="pay-price-big">฿59</div><div class="pay-price-note">ใช้ได้ 1 เดือน · ต่ออายุ ฿59 หลังหมดอายุ</div><label style="display:block;text-align:left;font-size:13px;color:var(--ink-dim);margin:18px 0 6px">เบอร์โทรศัพท์ (สำหรับกู้คืนสิทธิ์)</label><input id="payPhone" type="tel" placeholder="08x-xxx-xxxx" maxlength="10" class="text-field" style="margin-bottom:4px"><p id="payPhoneErr" class="pay-error" style="display:none"></p><button class="btn-paid" style="margin-top:14px" onclick="payStep1Next()">ถัดไป — ดู QR Code →</button><div style="margin-top:18px;border-top:1px solid var(--line-soft);padding-top:14px"><p style="font-size:12.5px;color:var(--ink-dimmer);margin-bottom:8px">เคยซื้อแล้ว? กู้คืนสิทธิ์ด้วยเบอร์เดิม</p><button class="paywall-cta" style="padding:10px 20px;font-size:13px" onclick="recoverAccess()">กู้คืนสิทธิ์</button></div></div>
+<!-- step OTP: recover access with a one-time code -->
+<div id="payStepOtp" style="display:none"><div class="pay-title" style="font-size:17px;margin-bottom:2px">ยืนยันตัวตน</div><p id="otpSentNote" style="font-size:13px;color:var(--ink-dim);line-height:1.65;margin:10px 0 2px"></p><label style="display:block;text-align:left;font-size:13px;color:var(--ink-dim);margin:16px 0 6px">รหัสยืนยัน 6 หลัก</label><input id="otpCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="••••••" class="text-field" style="letter-spacing:10px;text-align:center;font-size:20px" onkeydown="if(event.key==='Enter'){event.preventDefault();verifyOtpCode();}"><p id="otpMsg" class="pay-error" style="display:none"></p><p id="otpCountdown" style="font-size:12px;color:var(--ink-dimmer);margin:10px 0 0"></p><button id="otpVerifyBtn" class="btn-paid" style="margin-top:14px" onclick="verifyOtpCode()">ยืนยันรหัส</button><div style="margin-top:14px;display:flex;gap:10px;justify-content:center;align-items:center"><button id="otpResendBtn" class="paywall-cta" style="padding:8px 14px;font-size:12px;white-space:nowrap" onclick="resendOtpCode()">ส่งรหัสใหม่</button><button class="paywall-cta" style="padding:8px 14px;font-size:12px;white-space:nowrap" onclick="cancelOtp()">ย้อนกลับ</button></div><p style="font-size:11.5px;color:var(--ink-dimmer);line-height:1.6;margin:14px 0 0">ไม่ได้รับ SMS? ตรวจสอบว่ากรอกเบอร์ถูกต้อง แล้วกดส่งรหัสใหม่ หากยังไม่ได้รับ กรุณาติดต่อผู้ดูแลระบบ</p></div>
 <!-- step 2: QR -->
 <div id="payStep2" style="display:none"><div id="payQrLoading" class="pay-qr-placeholder"><div class="ai-spinner"></div></div><div id="payQrImg" class="pay-qr-area" style="display:none"><img id="payQrImgEl" src="" alt="QR Code PromptPay"></div><p id="payInstruction" class="pay-instruction" style="display:none">สแกน QR Code ด้วยแอปธนาคาร แล้วกดปุ่มด้านล่าง</p><a id="payHostedLink" href="#" target="_blank" rel="noopener" style="display:none;color:#E5C66B;font-size:13px;text-decoration:underline">เปิดหน้าชำระเงิน (Stripe)</a><button id="btnPaid" class="btn-paid" style="display:none" onclick="onPaidClick()">✓ ฉันจ่ายแล้ว — ปลดล็อคทุกอย่าง</button><p id="payErr" class="pay-error" style="display:none"></p></div>
 <p class="pay-security">🔒 ชำระเงินปลอดภัยโดย Stripe</p></div></div><div class="wrap"><section class="hero"><div class="wheel-holder"><svg class="wheel" viewBox="0 0 280 280" xmlns="http://www.w3.org/2000/svg"><defs><radialGradient id="lumaBg" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#B18A2B" stop-opacity="0.12"/><stop offset="100%" stop-color="#B18A2B" stop-opacity="0"/></radialGradient></defs><circle cx="140" cy="140" r="132" fill="url(#lumaBg)"/><circle cx="140" cy="140" r="128" fill="none" stroke="#B18A2B" stroke-opacity="0.35" stroke-width="0.8"/><circle cx="140" cy="140" r="104" fill="none" stroke="#D4AF4F" stroke-opacity="0.25" stroke-width="0.8"/><circle cx="140" cy="140" r="80" fill="none" stroke="#E5C66B" stroke-opacity="0.20" stroke-width="0.8"/><g fill="#ffd97d" opacity="0.85" font-family="Noto Serif Thai, serif" font-size="15" text-anchor="middle"><text x="140" y="20">♈</text><text x="212" y="38" transform="rotate(30 212 38)">♉</text><text x="256" y="90" transform="rotate(60 256 90)">♊</text><text x="266" y="146">♋</text><text x="252" y="200" transform="rotate(120 252 200)">♌</text><text x="212" y="244" transform="rotate(150 212 244)">♍</text><text x="140" y="266">♎</text><text x="70" y="244" transform="rotate(210 70 244)">♏</text><text x="30" y="200" transform="rotate(240 30 200)">♐</text><text x="16" y="146">♑</text><text x="30" y="90" transform="rotate(300 30 90)">♒</text><text x="70" y="38" transform="rotate(330 70 38)">♓</text></g><circle cx="140" cy="140" r="4" fill="#ffd97d" opacity="0.9"/><circle cx="140" cy="140" r="8" fill="none" stroke="#B18A2B" stroke-opacity="0.6" stroke-width="1"/></svg><div class="wheel-center"><img src="Logo/luma_icon_gold.png" alt="LUMA" style="width:175px;height:auto;object-fit:contain;filter:drop-shadow(0 0 12px rgba(61,50,24,.4))"></div></div><div class="luma-wordmark">LUMA</div><div class="luma-sub-wordmark">ลูม่า</div><div class="eyebrow">Thai Astrology · Bazi · Western Chart</div><h1>ส่องทางชีวิต<br><span>ด้วย 3 ศาสตร์ในที่เดียว</span></h1><p class="sub">กรอกวันเกิดและเวลาเกิด — LUMA คำนวณดวงชะตาจากโหราศาสตร์ไทย ปาจื่อจีน และโหราศาสตร์สากล แล้วสรุปออกมาเป็นภาษาคนที่อ่านแล้วเข้าใจได้เลย</p><form class="panel form-panel" id="birthForm"><div class="field-row"><div style="grid-column:1/-1"><label>วัน เดือน ปีเกิด</label><div class="dmy-row"><select id="bday" required></select> <select id="bmonth" required></select> <select id="byear" required></select></div></div></div><div class="field-row"><div style="grid-column:1/-1"><label for="bhour">เวลาเกิด</label><div class="hms-row"><select id="bhour" required></select> <span class="colon">:</span> <select id="bminute" required></select></div></div></div><div class="field-row"><div><label for="bplace">สถานที่เกิด</label> <select id="bplace" required></select></div><div><label for="bgender">เพศกำเนิด</label> <select id="bgender" required><option value="m">ชาย</option><option value="f">หญิง</option></select></div></div><div class="field-row" style="margin-top:4px"><div><label for="bname">ชื่อ (สำหรับผลดวง)</label> <input id="bname" class="text-field" placeholder="ชื่อของคุณ" required></div><div><label for="bemail">อีเมล (รับผลดวงทางอีเมล)</label> <input type="email" id="bemail" class="text-field" placeholder="email@example.com (ไม่บังคับ)"></div></div><button type="submit" class="btn">ดูดวงของฉัน ✨</button><p class="err" id="errMsg">กรุณากรอกวัน เวลา และสถานที่เกิดให้ครบก่อนนะ</p></form></section><section id="results"><div class="print-header" style="display:none;align-items:center;justify-content:center;gap:10px;padding:16px 0 10px;border-bottom:1px solid rgba(61,50,24,.2);margin-bottom:4px"><span style="font-family:Inter,sans-serif;font-weight:800;font-size:22px;letter-spacing:.18em;color:#E5C66B">LUMA</span> <span style="color:rgba(61,50,24,.4)">·</span> <span style="font-family:\'Noto Serif Thai\',serif;font-size:13px;color:#E5C66B;letter-spacing:.12em">ส่องทางชีวิตด้วย 3 ศาสตร์</span></div><div class="result-head"><h2 class="serif">ดวงชะตาของคุณ</h2><div class="mono" id="birthEcho"></div></div><div class="tabs"><button class="tab-btn active" data-tab="syn">สรุปรวม</button> <button class="tab-btn" data-tab="thai">สุริยยาตร์ไทย</button> <button class="tab-btn" data-tab="bazi">ปาจื่อ 八字</button> <button class="tab-btn" data-tab="west">โหราศาสตร์สากล</button> <button class="tab-btn tab-locked" id="tabCal" data-tab="cal">📅 ปฏิทิน 12 เดือน</button> <button class="tab-btn tab-locked" id="tabColor" data-tab="color">🎨 สีและเลขมงคล</button> <button class="tab-btn tab-locked" id="tabAuspicious" data-tab="auspicious">📆 ฤกษ์กิจการ</button> <button class="tab-btn tab-locked" id="tabCompat" data-tab="compat">❤️ ดูดวงคู่</button> <button class="tab-btn tab-locked" id="tabFace" data-tab="face">🔮 โหงวเฮ้ง</button> <button class="tab-btn tab-locked" id="tabPalm" data-tab="palm">✋ ลายมือ</button></div><div class="tab-pane active" id="pane-syn"><div class="panel card accent-syn"><h4 style="margin-top:22px">5 ด้านของชีวิตคุณ</h4><p class="desc">รวมมุมมองจากทั้ง 3 ศาสตร์ อ่านเฉพาะด้านที่สนใจได้เลย</p><div class="life-area career"><span class="life-label">งาน</span><p class="desc" id="careerText"></p></div><div class="life-area money"><span class="life-label">เงิน</span><p class="desc" id="moneyText"></p></div><div class="life-area health"><span class="life-label">การดูแลตัวเองและสมดุลชีวิต</span><p class="desc" id="healthText"></p></div><div class="life-area love"><span class="life-label">ความรัก</span><p class="desc" id="loveText"></p></div><div class="life-area spirit"><span class="life-label">จิตวิญญาณ</span><p class="desc" id="spiritText"></p></div><div id="shareBlock" style="margin-top:28px;text-align:center">
@@ -155,6 +157,8 @@ window.openPayModal=function(){
   document.getElementById("payModal").style.display="flex";
   document.getElementById("payStep1").style.display="block";
   document.getElementById("payStep2").style.display="none";
+  if(window.cancelOtp)cancelOtp();
+  document.getElementById("payStep1").style.display="block";
   document.getElementById("payPhoneErr").style.display="none";
   var ph=document.getElementById("payPhone");if(ph)ph.value="";
   Z=null;
@@ -222,28 +226,133 @@ function renderExpiryBanner(exDate){
   var daysTxt=daysLeft>1?("เหลืออีก "+daysLeft+" วัน"):(daysLeft===1?"เหลืออีก 1 วัน":"หมดอายุวันนี้");
   exBanner.innerHTML="สิทธิ์ใช้งาน "+daysTxt+" (ถึง "+exStr+") <button onclick=\"document.getElementById(\'payModal\').style.display=\'flex\'\" style=\"margin-left:10px;padding:3px 12px;background:#D4AF4F;color:#1A1408;border:none;border-radius:20px;font-size:12px;font-weight:700;cursor:pointer\">ต่ออายุ</button>";
 }
+/* Recovery by one-time code.
+   The old flow handed a working token to anyone who typed a customer's phone
+   number, and a charge id is not a secret either. This one sends a code to
+   the number on the order and issues a token only when that code comes back.
+
+   Two rules this screen must not break:
+   1. It never reveals whether a number belongs to a customer. The server
+      answers identically either way -- including a challengeId for numbers it
+      has never seen -- so this code moves to the code screen every time, with
+      the same wording, and reports every rejection with one message.
+   2. It never falls back to the old phone-only path. If the code service is
+      unavailable, recovery fails and says so; it does not let anyone in on a
+      phone number alone.
+
+   challengeId below is LUMA's own opaque id. Any provider-side token, refno or
+   message id stays on the server and never reaches the browser. */
+var OTP_TTL_SECONDS=300,OTP_RESEND_SECONDS=60;
+var _otpChallengeId=null,_otpPhone="",_otpDeadline=0,_otpResendAt=0,_otpTicker=null;
+function otpSay(msg,isError){
+  var el=document.getElementById("otpMsg");if(!el)return;
+  el.textContent=msg||"";el.style.display=msg?"block":"none";
+  el.className=isError?"pay-error":"";
+  el.style.color=isError?"":"var(--ink-dim)";
+}
+function otpTick(){
+  var now=Date.now();
+  var cd=document.getElementById("otpCountdown"),rb=document.getElementById("otpResendBtn");
+  var left=Math.max(0,Math.round((_otpDeadline-now)/1000));
+  if(cd)cd.textContent=left>0
+    ?("\u0e23\u0e2b\u0e31\u0e2a\u0e19\u0e35\u0e49\u0e43\u0e0a\u0e49\u0e44\u0e14\u0e49\u0e2d\u0e35\u0e01 "+Math.floor(left/60)+":"+(left%60<10?"0":"")+(left%60)+" \u0e19\u0e32\u0e17\u0e35")
+    :"\u0e23\u0e2b\u0e31\u0e2a\u0e2b\u0e21\u0e14\u0e2d\u0e32\u0e22\u0e38\u0e41\u0e25\u0e49\u0e27 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e01\u0e14\u0e2a\u0e48\u0e07\u0e23\u0e2b\u0e31\u0e2a\u0e43\u0e2b\u0e21\u0e48";
+  var wait=Math.max(0,Math.round((_otpResendAt-now)/1000));
+  if(rb){rb.disabled=wait>0;rb.textContent=wait>0
+    ?("\u0e02\u0e2d\u0e43\u0e2b\u0e21\u0e48\u0e43\u0e19 "+wait+" \u0e27\u0e34")
+    :"\u0e2a\u0e48\u0e07\u0e23\u0e2b\u0e31\u0e2a\u0e43\u0e2b\u0e21\u0e48";}
+  if(left<=0&&wait<=0&&_otpTicker){clearInterval(_otpTicker);_otpTicker=null;}
+}
+function otpStartTimers(){
+  _otpDeadline=Date.now()+OTP_TTL_SECONDS*1000;
+  _otpResendAt=Date.now()+OTP_RESEND_SECONDS*1000;
+  if(_otpTicker)clearInterval(_otpTicker);
+  _otpTicker=setInterval(otpTick,1000);otpTick();
+}
+window.cancelOtp=function(){
+  if(_otpTicker){clearInterval(_otpTicker);_otpTicker=null;}
+  _otpChallengeId=null;
+  var s=document.getElementById("payStepOtp");if(s)s.style.display="none";
+  var p=document.getElementById("payStep1");if(p)p.style.display="block";
+};
+/* The one place that talks to /api/request-otp. Anything other than a clean
+   answer with a challengeId is treated as "service unavailable" -- never as
+   permission to continue by phone number alone. */
+async function otpRequest(phone){
+  var res=await fetch("/api/request-otp",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({phone:phone})});
+  var data=null;try{data=await res.json();}catch(e){}
+  if(res.status===400&&data&&data.error)return{fatal:data.error};
+  if(!res.ok||!data||!data.challengeId)return{fatal:"\u0e23\u0e30\u0e1a\u0e1a\u0e22\u0e37\u0e19\u0e22\u0e31\u0e19\u0e15\u0e31\u0e27\u0e15\u0e19\u0e44\u0e21\u0e48\u0e1e\u0e23\u0e49\u0e2d\u0e21\u0e43\u0e0a\u0e49\u0e07\u0e32\u0e19\u0e0a\u0e31\u0e48\u0e27\u0e04\u0e23\u0e32\u0e27 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e25\u0e2d\u0e07\u0e43\u0e2b\u0e21\u0e48\u0e20\u0e32\u0e22\u0e2b\u0e25\u0e31\u0e07 \u0e2b\u0e23\u0e37\u0e2d\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e1c\u0e39\u0e49\u0e14\u0e39\u0e41\u0e25\u0e23\u0e30\u0e1a\u0e1a"};
+  return{challengeId:data.challengeId,message:data.message};
+}
 window.recoverAccess=async function(){
   var ph=(document.getElementById("payPhone").value||"").replace(/\D/g,"");
-  if(ph.length<9){document.getElementById("payPhoneErr").textContent="กรุณากรอกเบอร์โทรก่อน";document.getElementById("payPhoneErr").style.display="block";return;}
-  document.getElementById("payPhoneErr").style.display="none";
+  var err=document.getElementById("payPhoneErr");
+  if(ph.length<9||ph.length>10){
+    err.textContent="\u0e01\u0e23\u0e38\u0e13\u0e32\u0e01\u0e23\u0e2d\u0e01\u0e40\u0e1a\u0e2d\u0e23\u0e4c\u0e42\u0e17\u0e23\u0e43\u0e2b\u0e49\u0e16\u0e39\u0e01\u0e15\u0e49\u0e2d\u0e07 (10 \u0e2b\u0e25\u0e31\u0e01)";
+    err.style.display="block";return;
+  }
+  err.style.display="none";
+  var btns=document.querySelectorAll("#payStep1 button"),i;
+  for(i=0;i<btns.length;i++)btns[i].disabled=true;
+  var out;
+  try{out=await otpRequest(ph);}catch(e){out={fatal:"\u0e40\u0e0a\u0e37\u0e48\u0e2d\u0e21\u0e15\u0e48\u0e2d\u0e44\u0e21\u0e48\u0e2a\u0e33\u0e40\u0e23\u0e47\u0e08 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e25\u0e2d\u0e07\u0e43\u0e2b\u0e21\u0e48\u0e2d\u0e35\u0e01\u0e04\u0e23\u0e31\u0e49\u0e07"};}
+  for(i=0;i<btns.length;i++)btns[i].disabled=false;
+  if(out.fatal){err.textContent=out.fatal;err.style.display="block";return;}
+  _otpChallengeId=out.challengeId;_otpPhone=ph;
+  document.getElementById("otpSentNote").textContent=out.message||"\u0e2b\u0e32\u0e01\u0e40\u0e1a\u0e2d\u0e23\u0e4c\u0e19\u0e35\u0e49\u0e21\u0e35\u0e2a\u0e34\u0e17\u0e18\u0e34\u0e4c\u0e43\u0e0a\u0e49\u0e07\u0e32\u0e19\u0e2d\u0e22\u0e39\u0e48 \u0e23\u0e30\u0e1a\u0e1a\u0e44\u0e14\u0e49\u0e2a\u0e48\u0e07\u0e23\u0e2b\u0e31\u0e2a\u0e22\u0e37\u0e19\u0e22\u0e31\u0e19\u0e44\u0e1b\u0e43\u0e2b\u0e49\u0e41\u0e25\u0e49\u0e27";
+  var codeEl=document.getElementById("otpCode");codeEl.value="";
+  otpSay("");
+  document.getElementById("payStep1").style.display="none";
+  document.getElementById("payStepOtp").style.display="block";
+  otpStartTimers();try{codeEl.focus();}catch(e){}
+};
+window.resendOtpCode=async function(){
+  if(Date.now()<_otpResendAt)return;
+  otpSay("");
+  var rb=document.getElementById("otpResendBtn");rb.disabled=true;
+  var out;
+  try{out=await otpRequest(_otpPhone);}catch(e){out={fatal:"\u0e40\u0e0a\u0e37\u0e48\u0e2d\u0e21\u0e15\u0e48\u0e2d\u0e44\u0e21\u0e48\u0e2a\u0e33\u0e40\u0e23\u0e47\u0e08 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e25\u0e2d\u0e07\u0e43\u0e2b\u0e21\u0e48\u0e2d\u0e35\u0e01\u0e04\u0e23\u0e31\u0e49\u0e07"};}
+  if(out.fatal){otpSay(out.fatal,true);rb.disabled=false;return;}
+  /* A resend is a NEW challenge: the previous code is no longer the one being
+     checked, so the id is replaced rather than kept. */
+  _otpChallengeId=out.challengeId;
+  document.getElementById("otpCode").value="";
+  otpSay("\u0e2a\u0e48\u0e07\u0e23\u0e2b\u0e31\u0e2a\u0e43\u0e2b\u0e21\u0e48\u0e41\u0e25\u0e49\u0e27 \u0e2b\u0e32\u0e01\u0e40\u0e1a\u0e2d\u0e23\u0e4c\u0e19\u0e35\u0e49\u0e21\u0e35\u0e2a\u0e34\u0e17\u0e18\u0e34\u0e4c\u0e43\u0e0a\u0e49\u0e07\u0e32\u0e19\u0e2d\u0e22\u0e39\u0e48 \u0e04\u0e38\u0e13\u0e08\u0e30\u0e44\u0e14\u0e49\u0e23\u0e31\u0e1a SMS \u0e2d\u0e35\u0e01\u0e04\u0e23\u0e31\u0e49\u0e07");
+  otpStartTimers();
+};
+window.verifyOtpCode=async function(){
+  var code=(document.getElementById("otpCode").value||"").replace(/\D/g,"");
+  if(code.length<4){otpSay("\u0e01\u0e23\u0e38\u0e13\u0e32\u0e01\u0e23\u0e2d\u0e01\u0e23\u0e2b\u0e31\u0e2a 6 \u0e2b\u0e25\u0e31\u0e01\u0e17\u0e35\u0e48\u0e44\u0e14\u0e49\u0e23\u0e31\u0e1a\u0e17\u0e32\u0e07 SMS",true);return;}
+  if(!_otpChallengeId){otpSay("\u0e04\u0e33\u0e02\u0e2d\u0e19\u0e35\u0e49\u0e2b\u0e21\u0e14\u0e2d\u0e32\u0e22\u0e38\u0e41\u0e25\u0e49\u0e27 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e01\u0e14\u0e2a\u0e48\u0e07\u0e23\u0e2b\u0e31\u0e2a\u0e43\u0e2b\u0e21\u0e48",true);return;}
+  var btn=document.getElementById("otpVerifyBtn"),label=btn.textContent;
+  btn.disabled=true;btn.textContent="\u0e01\u0e33\u0e25\u0e31\u0e07\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e2d\u0e1a...";
   try{
-    var res=await fetch("/api/check-access?phone="+encodeURIComponent(ph));
-    var data=await res.json();
-    if(data.ok&&data.token){
+    var res=await fetch("/api/verify-otp",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({phone:_otpPhone,code:code,challengeId:_otpChallengeId})});
+    var data=null;try{data=await res.json();}catch(e){}
+    if(res.ok&&data&&data.ok&&data.token){
+      if(_otpTicker){clearInterval(_otpTicker);_otpTicker=null;}
       try{localStorage.setItem("luma_token",data.token);}catch(e){}
       document.getElementById("payModal").style.display="none";
-      if(data.expiresAt){renderExpiryBanner(new Date(data.expiresAt+'Z'));}
+      if(data.expiresAt){renderExpiryBanner(new Date(data.expiresAt+"Z"));}
       K();
       if(window.unlockVisionTabs)unlockVisionTabs();
-    }else if(data.expired){
-      try{localStorage.removeItem("luma_token");}catch(e){}
-      document.getElementById("payPhoneErr").textContent="สิทธิ์หมดอายุแล้ว กรุณาชำระเงินใหม่ ฿59";
-      document.getElementById("payPhoneErr").style.display="block";
-    }else{
-      document.getElementById("payPhoneErr").textContent="ไม่พบเบอร์นี้ในระบบ — กรุณาชำระเงินใหม่";
-      document.getElementById("payPhoneErr").style.display="block";
+      return;
     }
-  }catch(e){document.getElementById("payPhoneErr").textContent="เกิดข้อผิดพลาด กรุณาลองใหม่";document.getElementById("payPhoneErr").style.display="block";}
+    btn.disabled=false;btn.textContent=label;
+    if(res.status===401||res.status===400){
+      /* One message for every rejection. The server deliberately does not say
+         whether the code was wrong, expired, already used, out of attempts, or
+         never existed -- echoing that back would turn this screen into a way to
+         find out which numbers have live challenges. */
+      otpSay("\u0e23\u0e2b\u0e31\u0e2a\u0e22\u0e37\u0e19\u0e22\u0e31\u0e19\u0e44\u0e21\u0e48\u0e16\u0e39\u0e01\u0e15\u0e49\u0e2d\u0e07\u0e2b\u0e23\u0e37\u0e2d\u0e2b\u0e21\u0e14\u0e2d\u0e32\u0e22\u0e38\u0e41\u0e25\u0e49\u0e27 \u0e15\u0e23\u0e27\u0e08\u0e2a\u0e2d\u0e1a\u0e2d\u0e35\u0e01\u0e04\u0e23\u0e31\u0e49\u0e07 \u0e2b\u0e23\u0e37\u0e2d\u0e01\u0e14\u0e2a\u0e48\u0e07\u0e23\u0e2b\u0e31\u0e2a\u0e43\u0e2b\u0e21\u0e48",true);
+    }else{
+      otpSay("\u0e23\u0e30\u0e1a\u0e1a\u0e22\u0e37\u0e19\u0e22\u0e31\u0e19\u0e15\u0e31\u0e27\u0e15\u0e19\u0e44\u0e21\u0e48\u0e1e\u0e23\u0e49\u0e2d\u0e21\u0e43\u0e0a\u0e49\u0e07\u0e32\u0e19\u0e0a\u0e31\u0e48\u0e27\u0e04\u0e23\u0e32\u0e27 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e25\u0e2d\u0e07\u0e43\u0e2b\u0e21\u0e48\u0e20\u0e32\u0e22\u0e2b\u0e25\u0e31\u0e07",true);
+    }
+  }catch(e){
+    btn.disabled=false;btn.textContent=label;
+    otpSay("\u0e40\u0e0a\u0e37\u0e48\u0e2d\u0e21\u0e15\u0e48\u0e2d\u0e44\u0e21\u0e48\u0e2a\u0e33\u0e40\u0e23\u0e47\u0e08 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e2d\u0e1a\u0e2d\u0e34\u0e19\u0e40\u0e17\u0e2d\u0e23\u0e4c\u0e40\u0e19\u0e47\u0e15\u0e41\u0e25\u0e49\u0e27\u0e25\u0e2d\u0e07\u0e43\u0e2b\u0e21\u0e48",true);
+  }
 };
 (async function checkSavedAccess(){
   var token;try{token=localStorage.getItem("luma_token");}catch(e){}
