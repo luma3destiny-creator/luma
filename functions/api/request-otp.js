@@ -6,13 +6,22 @@
 // LUMA customer?" — so rate-limit refusals return the same body too.
 
 import { OTP_POLICY, generateCode, hashCode, hashPhone, hashIp, toE164Thai, toLocalThai,
-         checkSendAllowed, checkDailyCapAllowed, createChallenge, recordSendOutcome } from '../lib/otp.mjs';
+         reserveAndCreateChallenge, diagnoseBlock, recordSendOutcome } from '../lib/otp.mjs';
 import { sendSms } from '../lib/sms.mjs';
 
 export async function onRequestOptions() { return cors(null, 204); }
 
-// One response for every outcome. Never varied.
-const SAME_ANSWER = { ok: true, message: 'หากเบอร์นี้มีสิทธิ์ใช้งานอยู่ ระบบได้ส่งรหัสยืนยันไปให้แล้ว' };
+// One response shape for every outcome. The challengeId is ALWAYS present and
+// always a fresh random value — including for numbers that are not customers
+// and for throttled requests — so the response cannot be used to tell whether
+// a number belongs to a paying customer.
+function sameAnswer(challengeId) {
+  return {
+    ok: true,
+    challengeId,
+    message: 'หากเบอร์นี้มีสิทธิ์ใช้งานอยู่ ระบบได้ส่งรหัสยืนยันไปให้แล้ว'
+  };
+}
 
 export async function onRequestPost(context) {
   const { request, env } = context;
@@ -38,21 +47,6 @@ export async function onRequestPost(context) {
   const ipHash = await hashIp(pepper, ip);
 
   try {
-    const allowed = await checkSendAllowed(env, { phoneHash, ipHash });
-    if (!allowed.allowed) {
-      console.log('request-otp: throttled (' + allowed.reason + ')');
-      return json(SAME_ANSWER, 200);           // same answer as success
-    }
-
-    // Whole-system spend ceiling. Checked before anything is created or sent.
-    const cap = await checkDailyCapAllowed(env);
-    if (!cap.allowed) {
-      // Loud for the operator, silent for the caller — the response must not
-      // reveal that a cap exists, or it becomes a denial-of-service oracle.
-      console.error('request-otp: DAILY SMS CAP REACHED (' + cap.used + '/' + cap.cap + ') — recovery unavailable until it rolls over');
-      return json(SAME_ANSWER, 200);
-    }
-
     const local = toLocalThai(e164);
     const row = await env.DB.prepare(
       `SELECT id FROM payments
@@ -61,26 +55,50 @@ export async function onRequestPost(context) {
         ORDER BY paid_at DESC LIMIT 1`
     ).bind(local).first();
 
-    // No entitlement → do the same amount of nothing, and say the same thing.
-    if (!row) return json(SAME_ANSWER, 200);
+    // Not a customer: return the same shape, with a decoy id, having sent nothing.
+    if (!row) return json(sameAnswer(crypto.randomUUID()), 200);
 
     const code = generateCode();
     const codeHash = await hashCode(pepper, e164, code);
-    const challengeId = await createChallenge(env, { phoneHash, ipHash, codeHash });
+
+    // Quota is RESERVED by the same statement that creates the challenge —
+    // see reserveAndCreateChallenge. Nothing is sent unless we won a slot.
+    const reserved = await reserveAndCreateChallenge(env, { phoneHash, ipHash, codeHash });
+    if (!reserved.ok) {
+      const why = await diagnoseBlock(env, { phoneHash, ipHash });
+      if (why.reason === 'daily_cap_reached') {
+        console.error('request-otp: DAILY SMS CAP REACHED (' + why.used + '/' + why.cap + ') — recovery unavailable until it rolls over');
+      } else {
+        console.log('request-otp: throttled (' + why.reason + ')');
+      }
+      return json(sameAnswer(crypto.randomUUID()), 200);   // decoy id again
+    }
 
     const minutes = Math.round(OTP_POLICY.ttlSeconds / 60);
-    const sent = await sendSms(env, {
-      to: e164,
-      text: `LUMA: รหัสยืนยันของคุณคือ ${code} (ใช้ได้ ${minutes} นาที) อย่าบอกรหัสนี้กับผู้อื่น`
+    let sent;
+    try {
+      sent = await sendSms(env, {
+        to: e164,
+        text: `LUMA: รหัสยืนยันของคุณคือ ${code} (ใช้ได้ ${minutes} นาที) อย่าบอกรหัสนี้กับผู้อื่น`
+      });
+    } catch (e) {
+      // We asked and never learned the outcome. It may have been sent, and it
+      // may still be billed — so it is recorded as 'unknown', not 'failed'.
+      sent = { ok: false, status: 'unknown', reason: 'no_response', provider: env.SMS_PROVIDER || 'mock' };
+    }
+
+    // One attempt only: no automatic retry and no failing over to a second
+    // provider, either of which could deliver two codes for one request
+    // without us knowing the first one's real outcome.
+    await recordSendOutcome(env, reserved.challengeId, {
+      provider: sent.provider,
+      status: sent.status || (sent.ok ? 'sent' : 'failed'),
+      reason: sent.ok ? null : sent.reason
     });
     // Never log the code, the number, or whether a customer exists.
-    // One attempt only: no automatic retry loop and no failing over to a second
-    // provider, either of which could deliver two codes for one request without
-    // us knowing the first one's real outcome.
-    await recordSendOutcome(env, challengeId, { provider: sent.provider, ok: sent.ok, reason: sent.reason });
-    if (!sent.ok) console.error('request-otp: send failed (' + sent.reason + ')');
+    if (!sent.ok) console.error('request-otp: send not confirmed (' + (sent.status || 'failed') + '/' + sent.reason + ')');
 
-    return json(SAME_ANSWER, 200);
+    return json(sameAnswer(reserved.publicId), 200);
   } catch (e) {
     console.error('request-otp error');
     return json({ error: 'ระบบไม่พร้อมใช้งานชั่วคราว' }, 503);

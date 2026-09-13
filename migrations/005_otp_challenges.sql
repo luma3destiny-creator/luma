@@ -11,6 +11,7 @@
 
 CREATE TABLE IF NOT EXISTS otp_challenges (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_id   TEXT UNIQUE,        -- opaque id handed to the browser; not the row id
   phone_hash  TEXT NOT NULL,      -- SHA-256(pepper:phone:E164) — never the number
   ip_hash     TEXT,               -- SHA-256(pepper:ip:…) — for per-IP throttling
   code_hash   TEXT NOT NULL,      -- SHA-256(pepper:phone:code) — never the code
@@ -22,10 +23,11 @@ CREATE TABLE IF NOT EXISTS otp_challenges (
   -- Holds a provider name and a coarse status only: never the code, never
   -- the number, never a provider credential.
   provider    TEXT,
-  send_status TEXT,              -- 'sent' | 'failed'
+  send_status TEXT,              -- 'sent' (provider accepted) | 'failed' | 'unknown'
   send_error  TEXT               -- coarse reason, e.g. 'no_sender_id'
 );
 
 CREATE INDEX IF NOT EXISTS idx_otp_phone_created ON otp_challenges(phone_hash, created_at);
 CREATE INDEX IF NOT EXISTS idx_otp_ip_created    ON otp_challenges(ip_hash, created_at);
 CREATE INDEX IF NOT EXISTS idx_otp_created       ON otp_challenges(created_at);
+CREATE INDEX IF NOT EXISTS idx_otp_public         ON otp_challenges(public_id);

@@ -3,7 +3,8 @@
 // A token is issued ONLY after a code that we sent to that number is returned
 // correctly, within its lifetime, within the attempt budget, and unused.
 
-import { hashCode, hashPhone, toE164Thai, toLocalThai, consumeChallenge } from '../lib/otp.mjs';
+import { hashCode, hashPhone, toE164Thai, toLocalThai,
+         consumeChallengeByPublicId, challengePhoneHash } from '../lib/otp.mjs';
 
 export async function onRequestOptions() { return cors(null, 204); }
 
@@ -21,14 +22,24 @@ export async function onRequestPost(context) {
 
   const e164 = toE164Thai(body && body.phone);
   const code = typeof (body && body.code) === 'string' ? body.code.trim() : '';
-  if (!e164 || !/^\d{4,8}$/.test(code)) return json({ ok: false, error: 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว' }, 400);
+  const challengeId = typeof (body && body.challengeId) === 'string' ? body.challengeId.trim() : '';
+  if (!e164 || !challengeId || !/^\d{4,8}$/.test(code)) {
+    return json({ ok: false, error: 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว' }, 400);
+  }
 
   const pepper = env.OTP_PEPPER;
   const phoneHash = await hashPhone(pepper, e164);
   const codeHash = await hashCode(pepper, e164, code);
 
   try {
-    const result = await consumeChallenge(env, { phoneHash, codeHash });
+    // The challenge must belong to the number being claimed, or a decoy id
+    // from a non-customer request could be paired with someone else's code.
+    const boundHash = await challengePhoneHash(env, challengeId);
+    if (!boundHash || boundHash !== phoneHash) {
+      return json({ ok: false, error: 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว' }, 401);
+    }
+
+    const result = await consumeChallengeByPublicId(env, { publicId: challengeId, codeHash });
     if (!result.ok) {
       // One message for every failure mode: a caller must not learn whether the
       // code was wrong, expired, already used, or never existed.
