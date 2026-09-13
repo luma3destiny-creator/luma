@@ -30,9 +30,10 @@ export async function onRequestPost(context) {
     return json({ error: 'กรุณาชำระเงินก่อนดูผลดวง' }, 402);
   }
 
-  const isDevMode = chargeId === 'dev' || token === 'dev-token';
-
-  if (!isDevMode) {
+  // Dev bypass REMOVED (`chargeId === 'dev' || token === 'dev-token'` used to
+  // skip the whole entitlement check). Every request now goes through the
+  // real check below. Prices and existing paid customers are unaffected.
+  {
     let authorized = false;
 
     // Preferred: validate the persistent access token — same check as

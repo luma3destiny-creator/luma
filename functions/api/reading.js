@@ -30,12 +30,15 @@ export async function onRequestPost(context) {
     return json({ error: 'กรุณาชำระเงินก่อนดูผลดวง' }, 402);
   }
 
-  // Dev bypass
-  const isDevMode = chargeId === 'dev';
-
-  if (!isDevMode) {
+  // Dev bypass REMOVED (`chargeId === 'dev'` used to skip the check entirely).
+  {
     if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) {
-      console.warn('Redis not configured — skipping token check');
+      // FAIL CLOSED. This used to `console.warn` and then fall through,
+      // which meant that whenever the entitlement store was unconfigured
+      // ANY chargeId string unlocked a paid reading. If we cannot prove the
+      // request was paid for, we refuse it.
+      console.error('entitlement store not configured — denying request');
+      return json({ error: 'ระบบตรวจสอบสิทธิ์ไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่ภายหลัง' }, 503);
     } else {
       const key = encodeURIComponent('token:' + chargeId);
       const getUrl = `${env.UPSTASH_REDIS_REST_URL}/get/${key}`;

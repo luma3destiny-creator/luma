@@ -17,9 +17,9 @@ export async function onRequestGet(context) {
 
   try {
     if (token) {
-      // Verify by token (normal page-load check)
-      if (token === 'dev-token') return json({ ok: true });
-
+      // Verify by token (normal page-load check).
+      // NOTE: the hard-coded `if (token === 'dev-token') return ok:true`
+      // that used to sit here was a free-access bypass — removed.
       const row = await env.DB.prepare(
         `SELECT id, expires_at FROM payments WHERE token = ? AND status = 'paid' LIMIT 1`
       ).bind(token).first();

@@ -16,10 +16,13 @@ export async function onRequestPost(context) {
   const { chargeId } = body;
   if (!chargeId) return json({ error: 'ข้อมูลไม่ครบ' }, 400);
 
-  // Dev bypass
-  if (chargeId === 'dev') {
-    return json({ ok: true, token: 'dev-token' });
-  }
+  // Dev bypass REMOVED. `chargeId === 'dev'` used to return a working
+  // 'dev-token' here without ever contacting Stripe, and check-access.js +
+  // compat.js both accepted that token as proof of payment — so anyone who
+  // knew the string could unlock paid features for free. Paid access must
+  // only ever come from a Stripe-confirmed PaymentIntent below.
+  // To exercise this flow without real money, use the Preview environment
+  // with a Stripe test-mode key (sk_test_...).
 
   try {
     // Check Stripe PaymentIntent status
