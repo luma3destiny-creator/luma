@@ -17,8 +17,15 @@ CREATE TABLE IF NOT EXISTS otp_challenges (
   created_at  DATETIME NOT NULL,
   expires_at  DATETIME NOT NULL,
   attempts    INTEGER NOT NULL DEFAULT 0,
-  consumed_at DATETIME
+  consumed_at DATETIME,
+  -- Send outcome, for the operational counters (see the report's SQL).
+  -- Holds a provider name and a coarse status only: never the code, never
+  -- the number, never a provider credential.
+  provider    TEXT,
+  send_status TEXT,              -- 'sent' | 'failed'
+  send_error  TEXT               -- coarse reason, e.g. 'no_sender_id'
 );
 
 CREATE INDEX IF NOT EXISTS idx_otp_phone_created ON otp_challenges(phone_hash, created_at);
 CREATE INDEX IF NOT EXISTS idx_otp_ip_created    ON otp_challenges(ip_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_otp_created       ON otp_challenges(created_at);

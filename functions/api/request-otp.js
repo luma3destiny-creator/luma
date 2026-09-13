@@ -6,7 +6,7 @@
 // LUMA customer?" — so rate-limit refusals return the same body too.
 
 import { OTP_POLICY, generateCode, hashCode, hashPhone, hashIp, toE164Thai, toLocalThai,
-         checkSendAllowed, createChallenge } from '../lib/otp.mjs';
+         checkSendAllowed, checkDailyCapAllowed, createChallenge, recordSendOutcome } from '../lib/otp.mjs';
 import { sendSms } from '../lib/sms.mjs';
 
 export async function onRequestOptions() { return cors(null, 204); }
@@ -44,6 +44,15 @@ export async function onRequestPost(context) {
       return json(SAME_ANSWER, 200);           // same answer as success
     }
 
+    // Whole-system spend ceiling. Checked before anything is created or sent.
+    const cap = await checkDailyCapAllowed(env);
+    if (!cap.allowed) {
+      // Loud for the operator, silent for the caller — the response must not
+      // reveal that a cap exists, or it becomes a denial-of-service oracle.
+      console.error('request-otp: DAILY SMS CAP REACHED (' + cap.used + '/' + cap.cap + ') — recovery unavailable until it rolls over');
+      return json(SAME_ANSWER, 200);
+    }
+
     const local = toLocalThai(e164);
     const row = await env.DB.prepare(
       `SELECT id FROM payments
@@ -57,7 +66,7 @@ export async function onRequestPost(context) {
 
     const code = generateCode();
     const codeHash = await hashCode(pepper, e164, code);
-    await createChallenge(env, { phoneHash, ipHash, codeHash });
+    const challengeId = await createChallenge(env, { phoneHash, ipHash, codeHash });
 
     const minutes = Math.round(OTP_POLICY.ttlSeconds / 60);
     const sent = await sendSms(env, {
@@ -65,6 +74,10 @@ export async function onRequestPost(context) {
       text: `LUMA: รหัสยืนยันของคุณคือ ${code} (ใช้ได้ ${minutes} นาที) อย่าบอกรหัสนี้กับผู้อื่น`
     });
     // Never log the code, the number, or whether a customer exists.
+    // One attempt only: no automatic retry loop and no failing over to a second
+    // provider, either of which could deliver two codes for one request without
+    // us knowing the first one's real outcome.
+    await recordSendOutcome(env, challengeId, { provider: sent.provider, ok: sent.ok, reason: sent.reason });
     if (!sent.ok) console.error('request-otp: send failed (' + sent.reason + ')');
 
     return json(SAME_ANSWER, 200);

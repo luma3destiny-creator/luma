@@ -31,8 +31,8 @@ export async function sendSms(env, { to, text, tag = 'luma-otp' }) {
   }
 
   if (provider === 'brevo') {
-    if (!env.BREVO_API_KEY)  return { ok: false, reason: 'no_api_key' };
-    if (!env.SMS_SENDER_ID)  return { ok: false, reason: 'no_sender_id' };
+    if (!env.BREVO_API_KEY)  return { ok: false, reason: 'no_api_key', provider: 'brevo' };
+    if (!env.SMS_SENDER_ID)  return { ok: false, reason: 'no_sender_id', provider: 'brevo' };
 
     // Brevo requires the recipient in international format with country code
     // and no '+', and a sender of at most 11 alphanumeric characters.
@@ -57,15 +57,53 @@ export async function sendSms(env, { to, text, tag = 'luma-otp' }) {
       if (!res.ok) {
         // Log the provider's error code, never the recipient or the message.
         console.error('sms: brevo rejected the send:', data && data.code);
-        return { ok: false, reason: 'provider_error' };
+        return { ok: false, reason: 'provider_error', provider: 'brevo' };
       }
       return { ok: true, id: String((data && data.messageId) || ''), provider: 'brevo' };
     } catch (e) {
       console.error('sms: brevo request failed');
-      return { ok: false, reason: 'network_error' };
+      return { ok: false, reason: 'network_error', provider: 'brevo' };
+    }
+  }
+
+  if (provider === 'thsms') {
+    // THSMS v2 REST: a plain send-SMS API. It does NOT generate or verify
+    // codes, so Luma stays the only system that does — exactly one OTP
+    // implementation, per the round-1 design.
+    //
+    // NOT YET VERIFIED against a live account: THSMS's public docs do not
+    // document the sender field, delivery reports, or OTP suitability, and
+    // their price table lists no sender name for packages under 5,000 credits.
+    // Treat this adapter as unproven until a real send has been observed.
+    if (!env.THSMS_API_KEY) return { ok: false, reason: 'no_api_key' };
+    const recipient = to.replace(/^\+/, '');
+    try {
+      const res = await fetch('https://thsms.com/api/rest', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.THSMS_API_KEY}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          method: 'send',
+          msisdn: recipient,
+          message: text,
+          ...(env.SMS_SENDER_ID ? { sender: env.SMS_SENDER_ID } : {})
+        })
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        console.error('sms: thsms rejected the send:', data && (data.code || data.status));
+        return { ok: false, reason: 'provider_error', provider: 'thsms' };
+      }
+      return { ok: true, id: String((data && (data.message_id || data.id)) || ''), provider: 'thsms' };
+    } catch (e) {
+      console.error('sms: thsms request failed');
+      return { ok: false, reason: 'network_error', provider: 'thsms' };
     }
   }
 
   console.error('sms: unknown provider configured — refusing to send');
-  return { ok: false, reason: 'unknown_provider' };
+  return { ok: false, reason: 'unknown_provider', provider };
 }

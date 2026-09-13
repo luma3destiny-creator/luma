@@ -18,7 +18,16 @@ export const OTP_POLICY = {
   maxAttemptsPerCode: 5,      // wrong guesses before the code is burned
   maxSendsPerPhonePerHour: 3,
   minSecondsBetweenSends: 60,
-  maxSendsPerIpPerHour: 10
+  maxSendsPerIpPerHour: 10,
+  // Whole-system ceiling per day. This is a SPEND cap, not a security control:
+  // it bounds what a burst — or an attacker cycling through numbers — can cost.
+  // Override with env.OTP_DAILY_SMS_CAP.
+  //
+  // The trade-off is real and must be understood before enabling: once the cap
+  // is reached, genuine customers cannot recover access until the next day.
+  // They are not locked out of the product — an existing valid token keeps
+  // working — but recovery is unavailable until the counter rolls over.
+  defaultDailySmsCap: 20
 };
 
 // Digits only, and generated from a CSPRNG — not Math.random, which is
@@ -118,11 +127,37 @@ export async function checkSendAllowed(env, { phoneHash, ipHash }) {
   return { allowed: true };
 }
 
+/**
+ * Whole-system daily ceiling, counted from real rows so it holds across
+ * concurrent requests and across every Worker instance.
+ */
+export async function checkDailyCapAllowed(env) {
+  const cap = Number(env.OTP_DAILY_SMS_CAP ?? OTP_POLICY.defaultDailySmsCap);
+  if (!Number.isFinite(cap) || cap < 0) return { allowed: false, reason: 'bad_cap_config', cap: 0, used: 0 };
+
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM otp_challenges WHERE created_at > datetime('now', '-1 day')`
+  ).first();
+  const used = row ? Number(row.n) : 0;
+  return used >= cap
+    ? { allowed: false, reason: 'daily_cap_reached', cap, used }
+    : { allowed: true, cap, used };
+}
+
 export async function createChallenge(env, { phoneHash, ipHash, codeHash }) {
-  await env.DB.prepare(
+  const res = await env.DB.prepare(
     `INSERT INTO otp_challenges (phone_hash, ip_hash, code_hash, created_at, expires_at, attempts)
      VALUES (?, ?, ?, datetime('now'), datetime('now', '+${OTP_POLICY.ttlSeconds} seconds'), 0)`
   ).bind(phoneHash, ipHash, codeHash).run();
+  return (res && res.meta && res.meta.last_row_id) || null;
+}
+
+/** Record how the send went, for the operational counters. No secrets stored. */
+export async function recordSendOutcome(env, challengeId, { provider, ok, reason }) {
+  if (!challengeId) return;
+  await env.DB.prepare(
+    `UPDATE otp_challenges SET provider = ?, send_status = ?, send_error = ? WHERE id = ?`
+  ).bind(provider || null, ok ? 'sent' : 'failed', ok ? null : (reason || 'unknown'), challengeId).run();
 }
 
 /**
