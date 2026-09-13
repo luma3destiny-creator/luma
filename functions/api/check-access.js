@@ -33,7 +33,24 @@ export async function onRequestGet(context) {
     }
 
     if (phone) {
-      // Recover access by phone — issue a fresh token
+      // ── Phone-only recovery ────────────────────────────────────────────
+      // Knowing a phone number is NOT proof of owning it. This path hands a
+      // working access token to anyone who can type a customer's number, so
+      // it is being replaced by the OTP flow (/api/request-otp then
+      // /api/verify-otp), which sends a code to the number on the order.
+      //
+      // It stays enabled until OTP recovery actually works end to end,
+      // because switching it off first would strand paying customers with no
+      // way back in. Set OTP_RECOVERY_ENABLED='true' to close it, and only
+      // once a real code has been received on a real handset.
+      if (env.OTP_RECOVERY_ENABLED === 'true') {
+        return json({
+          ok: false,
+          code: 'USE_OTP_RECOVERY',
+          error: 'กรุณายืนยันตัวตนด้วยรหัส OTP ที่ส่งไปยังเบอร์ของคุณ'
+        }, 403);
+      }
+
       const normalized = normalizePhone(phone);
       if (!normalized) return json({ ok: false, error: 'เบอร์โทรไม่ถูกต้อง' }, 400);
 
