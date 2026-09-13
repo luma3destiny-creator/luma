@@ -329,7 +329,7 @@ async function runVision(mode){
   var personName=document.getElementById('fnameInput')?document.getElementById('fnameInput').value:'';
   try{
     var res=await fetch('/api/analyze-vision',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({imageBase64:img.base64,mediaType:img.type,mode:mode,personName:personName})});
+      body:JSON.stringify({imageBase64:img.base64,mediaType:img.type,mode:mode,personName:personName,token:(function(){try{return localStorage.getItem('luma_token')||''}catch(e){return ''}})()})});
     var data=await res.json();
     if(!data.ok){resultDiv.innerHTML='<p style="color:#f87171">'+viEsc(data.error)+'</p>';}
     else{renderVisionResult(data.result,mode,resultDiv);}

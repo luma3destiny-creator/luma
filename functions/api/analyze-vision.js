@@ -18,8 +18,24 @@ export async function onRequestPost(context) {
     return json({ error: 'Invalid JSON' }, 400);
   }
 
-  const { imageBase64, mediaType, mode, personName } = body;
+  const { imageBase64, mediaType, mode, personName, token } = body;
   if (!imageBase64 || !mode) return json({ error: 'ข้อมูลไม่ครบ' }, 400);
+
+  // ── Server-side entitlement check ────────────────────────────────────────
+  // Face/palm reading is part of the paid package. Until now this endpoint
+  // trusted the browser's own unlocked state, so a direct POST bypassed the
+  // paywall entirely and spent AI credit for free. The browser's opinion is
+  // no longer accepted as proof: the token it sends must match a row that
+  // this database says is genuinely paid and not expired.
+  //
+  // Fails CLOSED on every failure path — missing token, unknown/forged token,
+  // the retired 'dev-token' (it simply matches no paid row), expired access,
+  // or the database being unreachable. In none of those cases do we reach the
+  // AI call below. Nothing here changes prices or what an existing paying
+  // customer is entitled to.
+  const access = await checkPaidAccess(env, token);
+  if (!access.ok) return json({ ok: false, error: access.error }, access.status);
+
   if (!env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 500);
 
   const validTypes = ['image/jpeg','image/png','image/gif','image/webp'];
@@ -128,6 +144,40 @@ ${guardrails}
     console.error('Vision analysis failed:', e);
     return json({ error: 'เกิดข้อผิดพลาด กรุณาลองใหม่' }, 500);
   }
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+// Returns { ok:true } only when `token` maps to a row this database says is
+// paid and unexpired. Every other outcome — including an unusable database —
+// returns ok:false, so the caller denies the request instead of proceeding.
+async function checkPaidAccess(env, token) {
+  if (!env.DB) {
+    console.error('analyze-vision: no DB binding — denying');
+    return { ok: false, status: 503, error: 'ระบบตรวจสอบสิทธิ์ไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่ภายหลัง' };
+  }
+  if (!token || typeof token !== 'string' || !token.trim()) {
+    return { ok: false, status: 402, error: 'กรุณาปลดล็อคแพ็กเกจก่อนใช้งานส่วนนี้' };
+  }
+
+  let row;
+  try {
+    row = await env.DB.prepare(
+      `SELECT id, expires_at FROM payments WHERE token = ? AND status = 'paid' LIMIT 1`
+    ).bind(token.trim()).first();
+  } catch (e) {
+    // Fail closed: an entitlement we cannot verify is an entitlement we refuse.
+    console.error('analyze-vision: entitlement lookup failed — denying:', e);
+    return { ok: false, status: 503, error: 'ระบบตรวจสอบสิทธิ์ไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่ภายหลัง' };
+  }
+
+  if (!row) return { ok: false, status: 402, error: 'กรุณาปลดล็อคแพ็กเกจก่อนใช้งานส่วนนี้' };
+
+  if (row.expires_at && new Date(row.expires_at + 'Z') < new Date()) {
+    return { ok: false, status: 402, error: 'สิทธิ์การใช้งานหมดอายุแล้ว กรุณาต่ออายุ' };
+  }
+
+  return { ok: true };
 }
 
 function json(data, status = 200) {
