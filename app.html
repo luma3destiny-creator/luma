@@ -285,6 +285,52 @@ async function otpRequest(phone){
   if(!res.ok||!data||!data.challengeId)return{fatal:"\u0e23\u0e30\u0e1a\u0e1a\u0e22\u0e37\u0e19\u0e22\u0e31\u0e19\u0e15\u0e31\u0e27\u0e15\u0e19\u0e44\u0e21\u0e48\u0e1e\u0e23\u0e49\u0e2d\u0e21\u0e43\u0e0a\u0e49\u0e07\u0e32\u0e19\u0e0a\u0e31\u0e48\u0e27\u0e04\u0e23\u0e32\u0e27 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e25\u0e2d\u0e07\u0e43\u0e2b\u0e21\u0e48\u0e20\u0e32\u0e22\u0e2b\u0e25\u0e31\u0e07 \u0e2b\u0e23\u0e37\u0e2d\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e1c\u0e39\u0e49\u0e14\u0e39\u0e41\u0e25\u0e23\u0e30\u0e1a\u0e1a"};
   return{challengeId:data.challengeId,message:data.message};
 }
+/* Which recovery method is live is decided by the SERVER, not by this page.
+   /api/recovery-mode reads the one switch, OTP_RECOVERY_ENABLED, that also
+   makes /api/check-access refuse the phone-only path. So the two can never
+   disagree, and an old cached copy of this page cannot talk its way back into
+   phone-only recovery once the switch is on.
+
+   A failure to reach it is treated as "otp" on purpose. Reading a network error
+   as "phone-only is fine" is exactly the fallback that must not exist. */
+var _recoveryMode=null;
+async function recoveryMode(){
+  if(_recoveryMode)return _recoveryMode;
+  try{
+    var r=await fetch("/api/recovery-mode");
+    var d=await r.json();
+    _recoveryMode=(d&&d.mode==="phone")?"phone":"otp";
+  }catch(e){_recoveryMode="otp";}
+  return _recoveryMode;
+}
+/* The pre-OTP path, kept ONLY for the window before the switch is flipped, so
+   that shipping this page early strands nobody. It stops being reachable the
+   moment recovery-mode says "otp" -- and even if it were called, the server
+   refuses it. */
+async function legacyRecover(ph,err){
+  try{
+    var res=await fetch("/api/check-access?phone="+encodeURIComponent(ph));
+    var data=await res.json();
+    if(data.ok&&data.token){
+      try{localStorage.setItem("luma_token",data.token);}catch(e){}
+      document.getElementById("payModal").style.display="none";
+      if(data.expiresAt){renderExpiryBanner(new Date(data.expiresAt+"Z"));}
+      K();
+      if(window.unlockVisionTabs)unlockVisionTabs();
+      return;
+    }
+    if(data.expired){
+      try{localStorage.removeItem("luma_token");}catch(e){}
+      err.textContent="\u0e2a\u0e34\u0e17\u0e18\u0e34\u0e4c\u0e2b\u0e21\u0e14\u0e2d\u0e32\u0e22\u0e38\u0e41\u0e25\u0e49\u0e27 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e0a\u0e33\u0e23\u0e30\u0e40\u0e07\u0e34\u0e19\u0e43\u0e2b\u0e21\u0e48 \u0e3f59";
+    }else{
+      err.textContent="\u0e44\u0e21\u0e48\u0e1e\u0e1a\u0e40\u0e1a\u0e2d\u0e23\u0e4c\u0e19\u0e35\u0e49\u0e43\u0e19\u0e23\u0e30\u0e1a\u0e1a \u2014 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e0a\u0e33\u0e23\u0e30\u0e40\u0e07\u0e34\u0e19\u0e43\u0e2b\u0e21\u0e48";
+    }
+    err.style.display="block";
+  }catch(e){
+    err.textContent="\u0e40\u0e01\u0e34\u0e14\u0e02\u0e49\u0e2d\u0e1c\u0e34\u0e14\u0e1e\u0e25\u0e32\u0e14 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e25\u0e2d\u0e07\u0e43\u0e2b\u0e21\u0e48";
+    err.style.display="block";
+  }
+}
 window.recoverAccess=async function(){
   var ph=(document.getElementById("payPhone").value||"").replace(/\D/g,"");
   var err=document.getElementById("payPhoneErr");
@@ -294,6 +340,7 @@ window.recoverAccess=async function(){
   }
   err.style.display="none";
   var btns=document.querySelectorAll("#payStep1 button"),i;
+  if(await recoveryMode()==="phone"){ await legacyRecover(ph,err); return; }
   for(i=0;i<btns.length;i++)btns[i].disabled=true;
   var out;
   try{out=await otpRequest(ph);}catch(e){out={fatal:"\u0e40\u0e0a\u0e37\u0e48\u0e2d\u0e21\u0e15\u0e48\u0e2d\u0e44\u0e21\u0e48\u0e2a\u0e33\u0e40\u0e23\u0e47\u0e08 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e25\u0e2d\u0e07\u0e43\u0e2b\u0e21\u0e48\u0e2d\u0e35\u0e01\u0e04\u0e23\u0e31\u0e49\u0e07"};}

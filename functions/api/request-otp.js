@@ -4,17 +4,27 @@
 // number belongs to a paying customer, and whether or not a message was sent.
 // Anything else turns this into a free lookup service for "is this person a
 // LUMA customer?" — so rate-limit refusals return the same body too.
+//
+// That rule covers more than the response body. A challenge row is written for
+// EVERY request, so the cooldown and the hourly throttles behave the same for a
+// stranger's number as for a customer's; if rows existed only for customers,
+// asking twice in a minute would tell you who had paid. Rows for non-customers
+// never reserve an SMS slot, so they cost nothing and cannot drain the cap.
+//
+// The one difference that remains is timing: a customer's request additionally
+// calls the SMS provider, which takes longer. Closing that would mean making a
+// throwaway provider call for every stranger — real money for no message — so
+// it is left open, and written down here rather than pretended away.
 
 import { OTP_POLICY, generateCode, hashCode, hashPhone, hashIp, toE164Thai, toLocalThai,
-         reserveAndCreateChallenge, diagnoseBlock, recordSendOutcome } from '../lib/otp.mjs';
+         reserveRequestSlot, reserveSmsSlot, diagnoseBlock, recordSendOutcome } from '../lib/otp.mjs';
 import { sendSms } from '../lib/sms.mjs';
 
 export async function onRequestOptions() { return cors(null, 204); }
 
-// One response shape for every outcome. The challengeId is ALWAYS present and
-// always a fresh random value — including for numbers that are not customers
-// and for throttled requests — so the response cannot be used to tell whether
-// a number belongs to a paying customer.
+// One response shape for every outcome. The challengeId is ALWAYS present —
+// a real one when a slot was won, a fresh random decoy when it was not — so the
+// response cannot be used to tell whether a number belongs to a customer.
 function sameAnswer(challengeId) {
   return {
     ok: true,
@@ -47,6 +57,21 @@ export async function onRequestPost(context) {
   const ipHash = await hashIp(pepper, ip);
 
   try {
+    // Generated before we know whether this number is a customer, so the same
+    // work happens either way. For a non-customer the code is never sent and
+    // never guessable, which is what makes the row harmless.
+    const code = generateCode();
+    const codeHash = await hashCode(pepper, e164, code);
+
+    // Throttles are RESERVED by the same statement that records the request —
+    // see reserveRequestSlot. This runs for every number.
+    const reserved = await reserveRequestSlot(env, { phoneHash, ipHash, codeHash });
+    if (!reserved.ok) {
+      const why = await diagnoseBlock(env, { phoneHash, ipHash });
+      console.log('request-otp: throttled (' + why.reason + ')');
+      return json(sameAnswer(crypto.randomUUID()), 200);   // decoy id
+    }
+
     const local = toLocalThai(e164);
     const row = await env.DB.prepare(
       `SELECT id FROM payments
@@ -55,23 +80,19 @@ export async function onRequestPost(context) {
         ORDER BY paid_at DESC LIMIT 1`
     ).bind(local).first();
 
-    // Not a customer: return the same shape, with a decoy id, having sent nothing.
-    if (!row) return json(sameAnswer(crypto.randomUUID()), 200);
+    // Not a customer: the row stays, nothing is sent, no SMS budget is spent.
+    if (!row) return json(sameAnswer(reserved.publicId), 200);
 
-    const code = generateCode();
-    const codeHash = await hashCode(pepper, e164, code);
-
-    // Quota is RESERVED by the same statement that creates the challenge —
-    // see reserveAndCreateChallenge. Nothing is sent unless we won a slot.
-    const reserved = await reserveAndCreateChallenge(env, { phoneHash, ipHash, codeHash });
-    if (!reserved.ok) {
-      const why = await diagnoseBlock(env, { phoneHash, ipHash });
-      if (why.reason === 'daily_cap_reached') {
-        console.error('request-otp: DAILY SMS CAP REACHED (' + why.used + '/' + why.cap + ') — recovery unavailable until it rolls over');
+    // Spend budget is reserved separately and only now, so a stranger's request
+    // can never consume a customer's share of it.
+    const slot = await reserveSmsSlot(env, reserved.challengeId);
+    if (!slot.ok) {
+      if (slot.reason === 'daily_cap_reached') {
+        console.error('request-otp: DAILY SMS CAP REACHED — recovery unavailable until it rolls over');
       } else {
-        console.log('request-otp: throttled (' + why.reason + ')');
+        console.error('request-otp: cannot reserve send slot (' + slot.reason + ')');
       }
-      return json(sameAnswer(crypto.randomUUID()), 200);   // decoy id again
+      return json(sameAnswer(reserved.publicId), 200);
     }
 
     const minutes = Math.round(OTP_POLICY.ttlSeconds / 60);
@@ -79,6 +100,7 @@ export async function onRequestPost(context) {
     try {
       sent = await sendSms(env, {
         to: e164,
+        code,
         text: `LUMA: รหัสยืนยันของคุณคือ ${code} (ใช้ได้ ${minutes} นาที) อย่าบอกรหัสนี้กับผู้อื่น`
       });
     } catch (e) {

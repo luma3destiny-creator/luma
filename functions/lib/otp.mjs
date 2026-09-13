@@ -3,12 +3,26 @@
 // Replaces the old "give me a phone number and I'll give you a token" recovery,
 // which let anyone who knew a customer's phone number take over their access.
 //
-// Every limit is enforced in the DATABASE, and — importantly — as a SINGLE
-// statement. An earlier draft counted rows and then inserted, which is a
-// time-of-check/time-of-use race: N simultaneous requests all read "19 used"
-// and all insert, blowing straight through a cap of 20. The quota is now
-// RESERVED by the same statement that creates the challenge, so the database's
-// own write serialisation decides the winner and the cap holds exactly.
+// Three properties this file exists to hold:
+//
+// 1. LIMITS ARE RESERVED, NOT CHECKED. Every limit is enforced by the database
+//    as a SINGLE statement. An earlier draft counted rows and then inserted,
+//    which is a time-of-check/time-of-use race: N simultaneous requests all read
+//    "19 used" and all insert, blowing straight through a cap of 20. The quota
+//    is now reserved by the same statement that records the request, so the
+//    database's own write serialisation decides the winner.
+//
+// 2. A CHALLENGE ROW IS CREATED FOR EVERY REQUEST — customer or not. That is
+//    deliberate: if rows only existed for real customers, the cooldown and the
+//    hourly throttles would visibly behave differently for a customer's number
+//    than for a stranger's, which turns this endpoint into a way to find out who
+//    has paid. Rows for non-customers never reserve an SMS slot, so they cost
+//    nothing and cannot be used to burn the daily cap.
+//
+// 3. THE DAILY SMS CAP IS RESERVED SEPARATELY, just before sending, and counts
+//    only rows that actually reserved a send. Reserving it at insert time would
+//    let a stranger's request consume a customer's budget; counting it after the
+//    send would race.
 
 export const OTP_POLICY = {
   codeLength: 6,
@@ -81,54 +95,85 @@ function changesOf(result) {
   return 0;
 }
 
+function lastIdOf(result) {
+  if (!result) return null;
+  if (result.meta && result.meta.last_row_id != null) return result.meta.last_row_id;
+  if (result.lastInsertRowid != null) return Number(result.lastInsertRowid);
+  return null;
+}
+
 /**
- * Reserve one unit of every relevant quota AND create the challenge, in one
- * statement. Returns the public challenge id on success.
+ * Record a request and reserve one slot of the per-phone, per-IP and cooldown
+ * budgets — in one statement — for EVERY caller, customer or not.
  *
  * Why one statement: SQLite (and D1 on top of it) serialises writers, so the
  * subquery counts and the insert are evaluated inside the same implicit
  * transaction. Two concurrent callers cannot both see room for the last slot.
- * Splitting this into a check and a later insert would reintroduce the race.
+ * Splitting this into a check and a later insert reintroduces the race.
+ *
+ * Why for everyone: so that a number nobody has ever paid with is throttled
+ * exactly like a customer's number. See the header note.
  *
  * Returns { ok:true, publicId, challengeId } or { ok:false, reason }.
  */
-export async function reserveAndCreateChallenge(env, { phoneHash, ipHash, codeHash }) {
-  const cap = Number(env.OTP_DAILY_SMS_CAP ?? OTP_POLICY.defaultDailySmsCap);
-  if (!Number.isFinite(cap) || cap < 0) return { ok: false, reason: 'bad_cap_config' };
-
+export async function reserveRequestSlot(env, { phoneHash, ipHash, codeHash }) {
   const publicId = crypto.randomUUID();
 
   const res = await env.DB.prepare(
     `INSERT INTO otp_challenges
-        (public_id, phone_hash, ip_hash, code_hash, created_at, expires_at, attempts)
-     SELECT ?1, ?2, ?3, ?4, datetime('now'), datetime('now', '+${OTP_POLICY.ttlSeconds} seconds'), 0
+        (public_id, phone_hash, ip_hash, code_hash, created_at, expires_at, attempts, sms_reserved)
+     SELECT ?1, ?2, ?3, ?4, datetime('now'), datetime('now', '+${OTP_POLICY.ttlSeconds} seconds'), 0, 0
       WHERE (SELECT COUNT(*) FROM otp_challenges
-              WHERE created_at > datetime('now','-1 day')) < ?5
+              WHERE phone_hash = ?2 AND created_at > datetime('now','-1 hour')) < ?5
         AND (SELECT COUNT(*) FROM otp_challenges
-              WHERE phone_hash = ?2 AND created_at > datetime('now','-1 hour')) < ?6
-        AND (SELECT COUNT(*) FROM otp_challenges
-              WHERE ip_hash = ?3 AND created_at > datetime('now','-1 hour')) < ?7
+              WHERE ip_hash = ?3 AND created_at > datetime('now','-1 hour')) < ?6
         AND NOT EXISTS (SELECT 1 FROM otp_challenges
               WHERE phone_hash = ?2
                 AND created_at > datetime('now','-${OTP_POLICY.minSecondsBetweenSends} seconds'))`
   ).bind(
     publicId, phoneHash, ipHash, codeHash,
-    cap, OTP_POLICY.maxSendsPerPhonePerHour, OTP_POLICY.maxSendsPerIpPerHour
+    OTP_POLICY.maxSendsPerPhonePerHour, OTP_POLICY.maxSendsPerIpPerHour
   ).run();
 
-  if (changesOf(res) === 0) return { ok: false, reason: 'quota_or_throttle' };
-  return { ok: true, publicId, challengeId: (res.meta && res.meta.last_row_id) || null };
+  if (changesOf(res) === 0) return { ok: false, reason: 'throttled' };
+  return { ok: true, publicId, challengeId: lastIdOf(res) };
 }
 
 /**
- * Which limit actually blocked a reservation. For operator logs only — it is
+ * Reserve one unit of the whole-system daily SMS budget for a challenge that is
+ * about to be sent. One statement again, for the same reason.
+ *
+ * Only rows that won this reservation count towards the cap, so requests for
+ * numbers that are not customers — which never call this — cannot drain it.
+ */
+export async function reserveSmsSlot(env, challengeId) {
+  const cap = Number(env.OTP_DAILY_SMS_CAP ?? OTP_POLICY.defaultDailySmsCap);
+  if (!Number.isFinite(cap) || cap < 0) return { ok: false, reason: 'bad_cap_config' };
+
+  const res = await env.DB.prepare(
+    `UPDATE otp_challenges
+        SET sms_reserved = 1
+      WHERE id = ?1
+        AND sms_reserved = 0
+        AND (SELECT COUNT(*) FROM otp_challenges
+              WHERE sms_reserved = 1
+                AND created_at > datetime('now','-1 day')) < ?2`
+  ).bind(challengeId, cap).run();
+
+  if (changesOf(res) === 0) return { ok: false, reason: 'daily_cap_reached' };
+  return { ok: true };
+}
+
+/**
+ * Which limit actually blocked a request. For operator logs only — it is
  * advisory (read after the fact, so it can be slightly stale) and is never
  * surfaced to the caller.
  */
 export async function diagnoseBlock(env, { phoneHash, ipHash }) {
   const cap = Number(env.OTP_DAILY_SMS_CAP ?? OTP_POLICY.defaultDailySmsCap);
   const day = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM otp_challenges WHERE created_at > datetime('now','-1 day')`).first();
+    `SELECT COUNT(*) AS n FROM otp_challenges
+      WHERE sms_reserved = 1 AND created_at > datetime('now','-1 day')`).first();
   if (day && Number(day.n) >= cap) return { reason: 'daily_cap_reached', used: Number(day.n), cap };
   const phone = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM otp_challenges WHERE phone_hash = ? AND created_at > datetime('now','-1 hour')`
@@ -156,40 +201,67 @@ export async function recordSendOutcome(env, challengeId, { provider, status, re
 }
 
 /**
- * Check a submitted code against a specific challenge.
+ * Check a submitted code against a specific challenge, and reserve the token
+ * that will be issued if it matches.
  *
  * Both the attempt counter and the consumption are conditional UPDATEs whose
  * guards live in the WHERE clause, so concurrent submissions cannot overspend
  * the attempt budget or redeem one code twice.
+ *
+ * CRASH WINDOW. Consuming the code and writing the new token onto the payment
+ * row are two different writes, and the worker can die between them. If that
+ * happened and the code were simply burned, the customer would have paid, held
+ * a valid code, and still got nothing. So the token to be issued is decided and
+ * stored ON THE CHALLENGE in the same statement that consumes it, and
+ * `token_applied` records whether it reached `payments`. A retry with the same
+ * code then finishes the job and returns the SAME token — which is idempotent
+ * recovery, not a second grant.
+ *
+ * Returns { ok, challengeId, token, replay } or { ok:false, reason }.
  */
-export async function consumeChallengeByPublicId(env, { publicId, codeHash }) {
+export async function consumeChallengeByPublicId(env, { publicId, codeHash, candidateToken }) {
   // Reserve an attempt. The guards are part of the write, so N parallel
   // guesses consume N attempts and stop exactly at the limit.
   const attempt = await env.DB.prepare(
     `UPDATE otp_challenges
         SET attempts = attempts + 1
       WHERE public_id = ?
-        AND consumed_at IS NULL
         AND expires_at > datetime('now')
-        AND attempts < ?`
+        AND attempts < ?
+        AND (consumed_at IS NULL OR token_applied = 0)`
   ).bind(publicId, OTP_POLICY.maxAttemptsPerCode).run();
 
   if (changesOf(attempt) === 0) return { ok: false, reason: 'not_attemptable' };
 
   const row = await env.DB.prepare(
-    `SELECT id, code_hash FROM otp_challenges WHERE public_id = ? LIMIT 1`
+    `SELECT id, code_hash, consumed_at, issued_token, token_applied
+       FROM otp_challenges WHERE public_id = ? LIMIT 1`
   ).bind(publicId).first();
   if (!row) return { ok: false, reason: 'not_found' };
 
   if (!timingSafeEqual(row.code_hash, codeHash)) return { ok: false, reason: 'wrong_code' };
 
+  // Recovery path: this code was already accepted, but the token never reached
+  // the payment row. Hand back the same token and let the caller finish.
+  if (row.consumed_at && Number(row.token_applied) === 0 && row.issued_token) {
+    return { ok: true, challengeId: row.id, token: row.issued_token, replay: true };
+  }
+
   const consume = await env.DB.prepare(
-    `UPDATE otp_challenges SET consumed_at = datetime('now')
+    `UPDATE otp_challenges
+        SET consumed_at = datetime('now'), issued_token = ?
       WHERE public_id = ? AND consumed_at IS NULL`
-  ).bind(publicId).run();
+  ).bind(candidateToken, publicId).run();
 
   if (changesOf(consume) === 0) return { ok: false, reason: 'already_used' };
-  return { ok: true, challengeId: row.id };
+  return { ok: true, challengeId: row.id, token: candidateToken, replay: false };
+}
+
+/** Mark the issued token as delivered to `payments`, and stop storing it. */
+export async function markTokenApplied(env, challengeId) {
+  await env.DB.prepare(
+    `UPDATE otp_challenges SET token_applied = 1, issued_token = NULL WHERE id = ?`
+  ).bind(challengeId).run();
 }
 
 /** The phone hash a challenge was created for — used to find the order. */

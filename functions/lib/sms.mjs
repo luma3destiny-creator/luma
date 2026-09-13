@@ -1,31 +1,63 @@
 // functions/lib/sms.mjs — the one place that knows how to send an SMS.
 //
 // Deliberately a thin adapter: which provider we use for Thai OTP is NOT
-// settled (see the notes in the round-1 report — Brevo lists Thailand as a
-// supported destination but publishes no Thailand-specific sender/registration
-// guidance, and no per-message price). Keeping the provider behind this
-// interface means swapping it is a one-file change, not a rewrite.
+// settled. Keeping the provider behind this interface means swapping it is a
+// one-file change, not a rewrite.
 //
 // env.SMS_PROVIDER selects the implementation:
-//   'mock'  — records the message, sends nothing. The default, and the only
-//             value that should ever be set in Preview until real sending has
-//             been signed off. Costs nothing.
+//   'mock'  — records nothing anywhere the public can reach, sends nothing.
+//             The default, and the only value that should be set in Preview
+//             until real sending has been signed off. Costs nothing.
 //   'brevo' — Brevo transactional SMS.
+//   'thsms' — THSMS v2 REST (adapter written, never exercised against a live
+//             account — treat as unproven).
 //
 // Nothing here ever sends unless SMS_PROVIDER is explicitly set to a real
 // provider, so a missing config can never silently start spending money.
 
-export const SMS_MOCK_OUTBOX = [];   // test-visible; empty in production workers
+export const SMS_MOCK_OUTBOX = [];   // test-visible; per-isolate, never served
 
 /**
- * @returns {{ok:true, id:string, provider:string} | {ok:false, reason:string}}
+ * PREVIEW-ONLY TEST OUTBOX.
+ *
+ * A tester needs to read the code that "was sent". Returning it from the API or
+ * printing it to the log would hand every code to anyone who can reach Preview
+ * or read its logs, so neither happens. Instead, for an explicitly listed set of
+ * internal test numbers, the mock provider writes the message into a table only
+ * the account owner can read (wrangler d1 / the D1 console).
+ *
+ * Three gates, all of which must be open, and all of which are closed by
+ * default. Any real provider skips this path entirely.
  */
-export async function sendSms(env, { to, text, tag = 'luma-otp' }) {
+async function maybeRecordTestMessage(env, { to, text, code }) {
+  if ((env.SMS_PROVIDER || 'mock').toLowerCase() !== 'mock') return;
+  if (env.OTP_TEST_OUTBOX !== 'true') return;
+  const allow = String(env.OTP_TEST_PHONES || '')
+    .split(',').map(s => s.replace(/\D/g, '')).filter(Boolean);
+  const target = String(to).replace(/\D/g, '');
+  if (allow.indexOf(target) === -1) return;   // not an internal test number
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO otp_test_outbox (phone, code, body, created_at)
+       VALUES (?, ?, ?, datetime('now'))`
+    ).bind(target, code || null, text || null).run();
+  } catch (e) {
+    // The table only exists in Preview. Its absence must never break a send.
+    console.log('sms: test outbox unavailable — skipped');
+  }
+}
+
+/**
+ * @returns {{ok:boolean, status:'sent'|'failed'|'unknown', id?:string, reason?:string, provider:string}}
+ */
+export async function sendSms(env, { to, text, code = null, tag = 'luma-otp' }) {
   const provider = (env.SMS_PROVIDER || 'mock').toLowerCase();
 
   if (provider === 'mock') {
     // Never leave the message body in a log line — an OTP is a credential.
     SMS_MOCK_OUTBOX.push({ to, text, tag, at: new Date().toISOString() });
+    await maybeRecordTestMessage(env, { to, text, code });
     console.log('sms: mock provider — nothing sent');
     return { ok: true, status: 'sent', id: 'mock-' + SMS_MOCK_OUTBOX.length, provider: 'mock' };
   }
@@ -59,7 +91,7 @@ export async function sendSms(env, { to, text, tag = 'luma-otp' }) {
         console.error('sms: brevo rejected the send:', data && data.code);
         return { ok: false, status: 'failed', reason: 'provider_error', provider: 'brevo' };
       }
-      return { ok: true, id: String((data && data.messageId) || ''), provider: 'brevo' };
+      return { ok: true, status: 'sent', id: String((data && data.messageId) || ''), provider: 'brevo' };
     } catch (e) {
       console.error('sms: brevo request failed');
       return { ok: false, status: 'unknown', reason: 'network_error', provider: 'brevo' };
@@ -71,10 +103,11 @@ export async function sendSms(env, { to, text, tag = 'luma-otp' }) {
     // codes, so Luma stays the only system that does — exactly one OTP
     // implementation, per the round-1 design.
     //
-    // NOT YET VERIFIED against a live account: THSMS's public docs do not
-    // document the sender field, delivery reports, or OTP suitability, and
-    // their price table lists no sender name for packages under 5,000 credits.
-    // Treat this adapter as unproven until a real send has been observed.
+    // NOT YET VERIFIED against a live account. THSMS's public API page
+    // documents Check Credit / Send SMS / Send SMS Schedule Task and does not
+    // document the sender field or delivery reports; what a message actually
+    // shows as at the handset is unknown until a real send is observed. That is
+    // an open question, not a proven limitation.
     if (!env.THSMS_API_KEY) return { ok: false, status: 'failed', reason: 'no_api_key', provider: 'thsms' };
     const recipient = to.replace(/^\+/, '');
     try {
@@ -97,7 +130,7 @@ export async function sendSms(env, { to, text, tag = 'luma-otp' }) {
         console.error('sms: thsms rejected the send:', data && (data.code || data.status));
         return { ok: false, status: 'failed', reason: 'provider_error', provider: 'thsms' };
       }
-      return { ok: true, id: String((data && (data.message_id || data.id)) || ''), provider: 'thsms' };
+      return { ok: true, status: 'sent', id: String((data && (data.message_id || data.id)) || ''), provider: 'thsms' };
     } catch (e) {
       console.error('sms: thsms request failed');
       return { ok: false, status: 'unknown', reason: 'network_error', provider: 'thsms' };
