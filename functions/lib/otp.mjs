@@ -41,6 +41,11 @@ export const OTP_POLICY = {
   defaultDailySmsCap: 20
 };
 
+// How long after a code was accepted the interrupted-issue recovery path may
+// be used. Long enough that a person retrying qualifies, short enough that a
+// concurrent sibling request never does.
+const RECOVERY_MIN_AGE_SECONDS = 10;
+
 // Digits from a CSPRNG — not Math.random, which is predictable and would make
 // codes guessable from earlier ones.
 export function generateCode(length = OTP_POLICY.codeLength) {
@@ -257,7 +262,9 @@ export async function consumeChallengeByPublicId(env, { publicId, codeHash, cand
   if (changesOf(attempt) === 0) return { ok: false, reason: 'not_attemptable' };
 
   const row = await env.DB.prepare(
-    `SELECT id, code_hash, consumed_at, issued_token, token_applied
+    `SELECT id, code_hash, consumed_at, issued_token, token_applied,
+            (consumed_at IS NOT NULL
+             AND consumed_at <= datetime('now', '-${RECOVERY_MIN_AGE_SECONDS} seconds')) AS recoverable
        FROM otp_challenges WHERE public_id = ? LIMIT 1`
   ).bind(publicId).first();
   if (!row) return { ok: false, reason: 'not_found' };
@@ -266,7 +273,15 @@ export async function consumeChallengeByPublicId(env, { publicId, codeHash, cand
 
   // Recovery path: this code was already accepted, but the token never reached
   // the payment row. Hand back the same token and let the caller finish.
-  if (row.consumed_at && Number(row.token_applied) === 0 && row.issued_token) {
+  //
+  // `recoverable` is what keeps this from firing on a sibling request that is
+  // simply a few milliseconds behind: mid-flight, a run that has consumed the
+  // code but not yet written the token looks exactly like a run that died. The
+  // age check separates them, because a real retry is a person submitting the
+  // form again and is never this fast. Without it, two simultaneous submissions
+  // both answer 200 -- with the same token and one grant, so nothing is
+  // over-issued, but "this code worked twice" is not a thing to leave true.
+  if (Number(row.recoverable) === 1 && Number(row.token_applied) === 0 && row.issued_token) {
     return { ok: true, challengeId: row.id, token: row.issued_token, replay: true };
   }
 

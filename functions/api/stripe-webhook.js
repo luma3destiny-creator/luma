@@ -23,9 +23,16 @@
 // endpoint's secret will never validate live-mode events, and mixing them is
 // exactly how a test payment ends up granting real access.
 
-import { validatePaymentIntent, grantEntitlementOnce, markEventSeen } from '../lib/entitlement.mjs';
+import { validatePaymentIntent, grantEntitlementOnce, isEventProcessed, markEventProcessed } from '../lib/entitlement.mjs';
 
 const DEFAULT_TOLERANCE_SECONDS = 300; // Stripe's own default; never set to 0
+
+// How long an event is allowed to arrive BEFORE the order row it belongs to.
+// PromptPay events can beat our own INSERT by a moment, and Stripe retries for
+// about three days, so a young orphan is asked for again rather than dropped.
+// Past this age the order is never going to appear, and retrying forever helps
+// nobody — it is recorded, answered 200, and logged for a human.
+const ORDER_GRACE_SECONDS = 3600;
 
 export async function onRequestPost(context) {
   const { request, env } = context;
@@ -67,45 +74,64 @@ export async function onRequestPost(context) {
   }
 
   try {
-    // Duplicate delivery guard. Stripe explicitly does not guarantee
-    // exactly-once delivery or ordering, so the same event can arrive twice.
-    // (The grant below is idempotent on its own; this just makes replays cheap.)
-    const isNew = await markEventSeen(env, eventId, eventType);
-    if (!isNew) return text('duplicate ignored', 200);
+    // Cheap replay short-circuit. A row here means this event was FINISHED
+    // earlier — not merely received. See isEventProcessed.
+    if (await isEventProcessed(env, eventId)) return text('duplicate ignored', 200);
 
     const pi = event.data && event.data.object;
     const chargeId = pi && typeof pi.id === 'string' ? pi.id : null;
-    if (!chargeId) return text('no payment intent id', 200);
+    if (!chargeId) {
+      await markEventProcessed(env, eventId, eventType);
+      return text('no payment intent id', 200);
+    }
 
     const order = await env.DB.prepare(
       `SELECT id, amount, status, charge_id FROM payments WHERE charge_id = ? LIMIT 1`
     ).bind(chargeId).first();
 
-    // An event for something we have no order for is not an error on Stripe's
-    // side — acknowledge it rather than making Stripe retry forever.
+    // The event can genuinely arrive before we have written the order row.
+    // Answering 200 here would throw the event away and leave a paid customer
+    // with nothing, so a young one is refused so Stripe delivers it again.
     if (!order) {
-      console.warn('stripe-webhook: no matching order for this payment intent');
-      return text('no matching order', 200);
+      const createdAt = Number(event.created) || 0;
+      const ageSeconds = createdAt ? Math.floor(Date.now() / 1000) - createdAt : 0;
+      if (createdAt && ageSeconds > ORDER_GRACE_SECONDS) {
+        console.error('stripe-webhook: no order for this payment intent after ' +
+                      ageSeconds + 's — giving up, needs a human');
+        await markEventProcessed(env, eventId, eventType);
+        return text('no matching order', 200);
+      }
+      console.warn('stripe-webhook: order row not written yet — asking Stripe to retry');
+      return text('order not ready', 500);
     }
 
     const check = validatePaymentIntent(pi, order);
     if (!check.ok) {
+      // Genuinely from Stripe, genuinely does not entitle anyone. Retrying
+      // would not change that, so it is finished rather than left open.
       console.warn('stripe-webhook: payment intent rejected:', check.code);
-      // Deliberately 200: the event was genuinely from Stripe, it just does not
-      // entitle anyone. Retrying would not change that.
+      await markEventProcessed(env, eventId, eventType);
       return text('not entitled: ' + check.code, 200);
     }
 
     const grant = await grantEntitlementOnce(env, chargeId);
     if (!grant.ok) {
       if (grant.code === 'ENTITLEMENT_INCOMPLETE') {
+        // A data problem a retry cannot fix. Finished, and loud.
         console.error('stripe-webhook: order needs manual review');
+        await markEventProcessed(env, eventId, eventType);
         return text('needs manual review', 200);
       }
-      // A real failure on our side — let Stripe retry.
+      // Our own failure. Nothing is recorded, so the retry runs the whole thing
+      // again — which is the entire reason the row is written last.
       console.error('stripe-webhook: grant failed:', grant.code);
       return text('grant failed', 500);
     }
+
+    // Only now. If the worker dies before this line, the retry repeats the
+    // grant, which is idempotent: granted comes back false and the event
+    // completes normally, without a second entitlement.
+    await markEventProcessed(env, eventId, eventType);
 
     // No token in the response. The customer collects it from /api/verify or
     // the recovery flow, both of which authenticate the caller.

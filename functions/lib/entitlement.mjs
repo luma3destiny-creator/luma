@@ -159,12 +159,35 @@ export async function grantEntitlementOnce(env, chargeId, { now = null } = {}) {
  * and false for every replay, so the caller can drop duplicates cheaply.
  * Relies on the PRIMARY KEY in migrations/004_webhook_events.sql.
  */
-export async function markEventSeen(env, eventId, eventType) {
-  const res = await env.DB.prepare(
+/**
+ * `webhook_events` records events we FINISHED, never events we merely received.
+ *
+ * The distinction is the whole point. An earlier version wrote the row on
+ * arrival and then did the work: when the work failed, the row was already
+ * there, so Stripe's retry of the same event was answered "duplicate ignored"
+ * and the payment stayed pending forever with no token. Recording receipt and
+ * calling it success is how a paid customer silently gets nothing.
+ *
+ * So the row is written only after the event has been dealt with, and a present
+ * row therefore means "already dealt with" rather than "already seen".
+ *
+ * This table is an optimisation, not the safety mechanism. Two deliveries of
+ * the same event arriving at once will both pass the check and both process —
+ * and that is harmless, because grantEntitlementOnce grants once no matter how
+ * many callers ask. Correctness lives there; this only keeps replays cheap.
+ */
+export async function isEventProcessed(env, eventId) {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS found FROM webhook_events WHERE event_id = ? LIMIT 1`
+  ).bind(eventId).first();
+  return !!row;
+}
+
+export async function markEventProcessed(env, eventId, eventType) {
+  await env.DB.prepare(
     `INSERT OR IGNORE INTO webhook_events (event_id, event_type, received_at)
      VALUES (?, ?, datetime('now'))`
   ).bind(eventId, eventType || null).run();
-  return changesOf(res) > 0;
 }
 
 export async function fetchPaymentIntent(env, chargeId) {

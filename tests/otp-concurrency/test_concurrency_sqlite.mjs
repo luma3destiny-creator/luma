@@ -35,6 +35,7 @@ function freshDb(paidPhones) {
   }
   const { raw } = openD1(DBFILE);
   raw.exec(fs.readFileSync(path.join(HERE, 'schema.sql'), 'utf8'));
+  raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '004_webhook_events.sql'), 'utf8'));
   raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '005_otp_challenges.sql'), 'utf8'));
   raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '006_preview_test_outbox.sql'), 'utf8'));
   for (const p of paidPhones) {
@@ -55,6 +56,39 @@ function ageChallenges(seconds) {
   const { raw } = openD1(DBFILE);
   try {
     raw.prepare(`UPDATE otp_challenges SET created_at = datetime(created_at, '-${seconds} seconds')`).run();
+  } finally { raw.close(); }
+}
+
+// A PENDING order, the state /api/pay leaves behind before the customer has
+// paid. Fixture data in a throwaway temp database — nothing here is ever run
+// against Preview or Production, and no row is ever hand-marked paid: the
+// webhook under test is what does that.
+function seedPendingOrder(chargeId, phone = '0900000000', amount = 5900) {
+  const { raw } = openD1(DBFILE);
+  try {
+    raw.prepare(
+      `INSERT INTO payments (phone, charge_id, amount, status, created_at)
+       VALUES (?, ?, ?, 'pending', datetime('now'))`
+    ).run(phone, chargeId, amount);
+  } finally { raw.close(); }
+}
+
+function orderRow(chargeId) {
+  return read((raw) => raw.prepare(
+    `SELECT status, token, paid_at, expires_at FROM payments WHERE charge_id = ?`
+  ).get(chargeId));
+}
+
+function eventRows() {
+  return read((raw) => raw.prepare(`SELECT event_id FROM webhook_events`).all());
+}
+
+// A run that died is only distinguishable from a sibling still in flight by how
+// long ago it accepted the code, so the crash cases have to look their age.
+function ageConsumed(seconds) {
+  const { raw } = openD1(DBFILE);
+  try {
+    raw.prepare(`UPDATE otp_challenges SET consumed_at = datetime(consumed_at, '-${seconds} seconds') WHERE consumed_at IS NOT NULL`).run();
   } finally { raw.close(); }
 }
 
@@ -191,6 +225,7 @@ console.log('\n--- real SQLite, real parallel processes, mock SMS --------------
   const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges LIMIT 1`).get()).public_id;
 
   const crashed = await burst([['verify-crash', phone, code, pub]], { CAP: '20' });
+  ageConsumed(30);
   check('the interrupted run did accept the code', !!(crashed[0].crashedAfter && crashed[0].crashedAfter.ok));
   const mid = read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token;
   check('after the crash the payment row still holds the OLD token',
@@ -446,6 +481,7 @@ console.log('\n--- real SQLite, real parallel processes, mock SMS --------------
   const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
 
   await burst([['verify-crash', phone, code, pub]], { CAP: '20' });
+  ageConsumed(30);
   const retry = await burst([['verify', phone, code, pub]], { CAP: '20' });
   check('crash recovery still works when no newer code was sent',
         retry[0].status === 200 && retry[0].body.token === 'tok-from-crashed-run',
@@ -464,6 +500,7 @@ console.log('\n--- real SQLite, real parallel processes, mock SMS --------------
   const codeA = codeFor(E164);
   const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
   await burst([['verify-crash', phone, codeA, pubA]], { CAP: '20' });
+  ageConsumed(30);
 
   ageChallenges(70);
   await burst([['request', phone, '10.19.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
@@ -493,6 +530,134 @@ console.log('\n--- real SQLite, real parallel processes, mock SMS --------------
   await burst([['verify', phone, code, pub]], { CAP: '20' });
   check('recovering access never moves the entitlement expiry date',
         read((raw) => raw.prepare(`SELECT expires_at FROM payments WHERE phone=?`).get(phone)).expires_at === before);
+}
+
+
+// ════ Stripe webhook: a retry must be able to finish what a failure started ══
+//
+// The bug: the event was recorded on ARRIVAL and the work done afterwards. When
+// the work failed, the first delivery answered 500, Stripe retried, and the
+// retry found the row already there and answered "duplicate ignored" — while
+// the payment sat pending with no token. A paid customer, silently given
+// nothing, with the books saying the event was handled.
+
+// ── 21. a failure before granting must leave the event retryable ───────────
+{
+  freshDb([]);
+  const CH = 'pi_wh_retry';
+  seedPendingOrder(CH);
+
+  const first = await burst([['webhook', CH, 'evt_retry_1']], { FAIL_AT: 'grant' });
+  check('a database failure while granting answers 500 so Stripe retries',
+        first[0].status === 500, 'status=' + first[0].status);
+  check('…the order is still pending', orderRow(CH).status === 'pending');
+  check('…and NOTHING was recorded, so the event is not marked handled',
+        eventRows().length === 0, 'events=' + eventRows().length);
+
+  const retry = await burst([['webhook', CH, 'evt_retry_1']]);
+  check('the retry of the same event actually grants (not "duplicate ignored")',
+        retry[0].status === 200 && retry[0].body === 'ok',
+        'status=' + retry[0].status + ' body=' + retry[0].body);
+  const row = orderRow(CH);
+  check('…the order is now paid', row.status === 'paid');
+  check('…and it has a token', !!row.token);
+  check('…and the event is recorded only now', eventRows().length === 1);
+}
+
+// ── 22. a failure AFTER granting, before recording, still completes ────────
+{
+  freshDb([]);
+  const CH = 'pi_wh_after';
+  seedPendingOrder(CH);
+
+  const first = await burst([['webhook', CH, 'evt_after_1']], { FAIL_AT: 'record_event' });
+  check('dying after the grant answers 500', first[0].status === 500, 'status=' + first[0].status);
+  const mid = orderRow(CH);
+  check('…the entitlement was granted anyway', mid.status === 'paid' && !!mid.token);
+  check('…but the event is not recorded', eventRows().length === 0);
+
+  const retry = await burst([['webhook', CH, 'evt_after_1']]);
+  check('the retry completes without granting a second time',
+        retry[0].status === 200, 'status=' + retry[0].status);
+  const after = orderRow(CH);
+  check('…the token is unchanged', after.token === mid.token);
+  check('…the paid_at is unchanged', after.paid_at === mid.paid_at);
+  check('…and the expiry date was not moved', after.expires_at === mid.expires_at);
+  check('…and the event is recorded once', eventRows().length === 1);
+}
+
+// ── 23. simultaneous deliveries grant exactly once ────────────────────────
+{
+  freshDb([]);
+  const CH = 'pi_wh_race';
+  seedPendingOrder(CH);
+
+  const all = await burst(Array.from({ length: 6 }, () => ['webhook', CH, 'evt_race_1']));
+  check('6 simultaneous deliveries of one event all answer 200',
+        all.every(r => r.status === 200), JSON.stringify(all.map(r => r.status)));
+  const row = orderRow(CH);
+  check('…the order is paid exactly once, with one token', row.status === 'paid' && !!row.token);
+  check('…and only one event row exists', eventRows().length === 1);
+  check('…and no response leaked a token',
+        all.every(r => !String(r.body).includes(row.token)));
+}
+
+// ── 24. a replay after success is cheap and changes nothing ───────────────
+{
+  freshDb([]);
+  const CH = 'pi_wh_replay';
+  seedPendingOrder(CH);
+  await burst([['webhook', CH, 'evt_replay_1']]);
+  const before = orderRow(CH);
+
+  const again = await burst([['webhook', CH, 'evt_replay_1']]);
+  check('replaying a finished event answers duplicate ignored',
+        again[0].status === 200 && again[0].body === 'duplicate ignored',
+        'body=' + again[0].body);
+  const after = orderRow(CH);
+  check('…and the token, paid_at and expiry are all untouched',
+        after.token === before.token && after.paid_at === before.paid_at &&
+        after.expires_at === before.expires_at);
+}
+
+// ── 25. an event that arrives before its order is not thrown away ─────────
+{
+  freshDb([]);
+  const CH = 'pi_wh_early';
+
+  const early = await burst([['webhook', CH, 'evt_early_1']]);
+  check('an event with no order yet answers 500 so Stripe delivers it again',
+        early[0].status === 500, 'status=' + early[0].status);
+  check('…and it is NOT marked handled', eventRows().length === 0);
+
+  // …then /api/pay writes the order, and the retry lands.
+  seedPendingOrder(CH);
+  const late = await burst([['webhook', CH, 'evt_early_1']]);
+  check('once the order exists the retry grants normally',
+        late[0].status === 200 && late[0].body === 'ok', 'status=' + late[0].status);
+  check('…the order is paid', orderRow(CH).status === 'paid');
+}
+
+// ── 26. an orphan event does not retry forever ────────────────────────────
+{
+  freshDb([]);
+  const old = await burst([['webhook', 'pi_wh_never', 'evt_orphan_1', '5900', '7200']]);
+  check('an event still orphaned after the grace period is closed out, not retried',
+        old[0].status === 200 && old[0].body === 'no matching order',
+        'status=' + old[0].status + ' body=' + old[0].body);
+  check('…and it is recorded so Stripe stops', eventRows().length === 1);
+}
+
+// ── 27. a wrong amount never entitles, and never retries ──────────────────
+{
+  freshDb([]);
+  const CH = 'pi_wh_amount';
+  seedPendingOrder(CH);
+  const res = await burst([['webhook', CH, 'evt_amount_1', '100']]);
+  check('a mismatched amount answers 200 (retrying cannot fix it)',
+        res[0].status === 200 && String(res[0].body).indexOf('not entitled') === 0,
+        'body=' + res[0].body);
+  check('…and grants nothing', orderRow(CH).status === 'pending' && !orderRow(CH).token);
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed   (real SQLite file, ' +
