@@ -38,20 +38,34 @@ export async function onRequestOptions() {
 export async function onRequestPost(context) {
   const { request, env } = context;
 
+  if (!env.DB) return json({ error: 'ระบบส่งอีเมลยังไม่พร้อม' }, 503);
   let body;
   try {
-    body = await request.json();
+    const raw = await request.text();
+    if (new TextEncoder().encode(raw).length > 65536) return json({ error: 'รายงานมีขนาดใหญ่เกินไป' }, 413);
+    body = JSON.parse(raw);
   } catch {
     return json({ error: 'Invalid JSON' }, 400);
   }
 
-  const { email } = body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ error: 'Invalid payload' }, 400);
+  const { email, token } = body;
+  if (typeof token !== 'string' || !token || token.length > 256 || ['dev', 'dev-token'].includes(token)) {
+    return json({ error: 'กรุณากู้คืนสิทธิ์ก่อนส่งอีเมล' }, 401);
+  }
+  let order;
+  try {
+    order = await env.DB.prepare("SELECT id FROM payments WHERE token = ? AND status = 'paid' AND datetime(expires_at) > datetime('now') LIMIT 1").bind(token).first();
+  } catch {
+    return json({ error: 'ระบบตรวจสิทธิ์ยังไม่พร้อม' }, 503);
+  }
+  if (!order) return json({ error: 'สิทธิ์ไม่ถูกต้องหรือหมดอายุ กรุณากู้คืนสิทธิ์' }, 403);
 
   if (!email) {
     return json({ error: 'กรุณาระบุอีเมล' }, 400);
   }
 
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+  if (typeof email !== 'string' || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return json({ error: 'รูปแบบอีเมลไม่ถูกต้อง' }, 400);
   }
 
@@ -60,6 +74,21 @@ export async function onRequestPost(context) {
   }
 
   const view = normalizePayload(body);
+  if (!view.sections.length) return json({ error: 'กรุณารอให้รายงานโหลดเสร็จก่อนส่งอีเมล' }, 400);
+  // Reserve atomically; failed/unknown provider outcomes still consume quota.
+  // Key by payment ID so OTP token rotation cannot reset the limit.
+  try {
+    const reserved = await env.DB.prepare(`INSERT INTO email_send_attempts (payment_id)
+      SELECT id FROM payments WHERE id = ? AND token = ? AND status = 'paid'
+      AND datetime(expires_at) > datetime('now')
+      AND (SELECT COUNT(*) FROM email_send_attempts WHERE created_at > datetime('now','-24 hours')) < 20
+      AND (SELECT COUNT(*) FROM email_send_attempts WHERE payment_id = ? AND created_at > datetime('now','-24 hours')) < 3
+      AND NOT EXISTS (SELECT 1 FROM email_send_attempts WHERE payment_id = ? AND created_at > datetime('now','-60 seconds'))
+    `).bind(order.id, token, order.id, order.id).run();
+    if (reserved.meta?.changes !== 1) return json({ error: 'ส่งอีเมลถี่เกินไปหรือครบโควตาแล้ว กรุณาลองภายหลัง' }, 429);
+  } catch {
+    return json({ error: 'ระบบจำกัดการส่งยังไม่พร้อม กรุณาลองภายหลัง' }, 503);
+  }
   const htmlContent = buildEmailHtml(view);
   const textContent = buildEmailText(view);
 
@@ -78,20 +107,17 @@ export async function onRequestPost(context) {
         'Content-Type': 'application/json',
         'api-key': env.BREVO_API_KEY
       },
-      body: JSON.stringify(brevoPayload)
+      body: JSON.stringify(brevoPayload),
+      signal: AbortSignal.timeout(10000)
     });
 
-    const data = await res.json();
-
     if (!res.ok) {
-      console.error('Brevo error:', data);
       return json({ error: 'ส่งอีเมลไม่สำเร็จ กรุณาลองใหม่อีกครั้ง' }, 502);
     }
 
-    return json({ ok: true, messageId: data.messageId });
+    return json({ ok: true });
   } catch (e) {
-    console.error('Email send failed:', e);
-    return json({ error: 'เกิดข้อผิดพลาดในการส่งอีเมล กรุณาลองใหม่' }, 502);
+    return json({ error: 'ยังยืนยันผลการส่งไม่ได้ กรุณาตรวจกล่องจดหมายก่อนลองใหม่' }, 502);
   }
 }
 
@@ -110,6 +136,7 @@ export function normalizePayload(body) {
 
   const rawSections = Array.isArray(body.sections) ? body.sections : [];
   const sections = rawSections
+    .slice(0, 10)
     .map(function (s) {
       return {
         label: cleanText(s && s.label, '', 80),

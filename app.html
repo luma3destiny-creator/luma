@@ -1108,4 +1108,46 @@ window.simulateUnlock=function(){
 if("1"===new URLSearchParams(location.search).get("dev")){
   setTimeout(unlockVisionTabs, 500);
 }
+</script>
+<script>
+// Authenticated email submission for both reports, including returning users.
+(function () {
+  var sending = false;
+  window.sendByEmail = async function (type) {
+    if (sending) return;
+    var compat = type === 'compat';
+    var notice = document.getElementById(compat ? 'emailCompatOk' : 'emailSendOk');
+    if (notice) notice.style.display = 'none';
+    var token = '';
+    try { token = localStorage.getItem('luma_token') || ''; } catch (_) {}
+    if (!token) { alert('กรุณากู้คืนสิทธิ์ก่อนส่งอีเมล'); return; }
+    function value(id) { return (document.getElementById(id) || {}).value || ''; }
+    var payload = { token: token, email: value('bemail').trim(), personName: value('bname'), reportType: compat ? 'compat' : 'reading' };
+    if (!payload.email) { alert('กรุณาระบุอีเมล'); return; }
+    if (compat) {
+      payload.personName2 = value('compatName');
+      payload.sections = window._compatSections || [];
+      payload.summary = window._compatSummary || null;
+    } else {
+      var intro = document.getElementById('synText');
+      payload.overview = intro ? intro.innerText.trim() : '';
+      payload.sections = [['careerText','งาน'],['moneyText','เงิน'],['healthText','การดูแลตัวเองและสมดุลชีวิต'],['loveText','ความรัก'],['spiritText','จิตวิญญาณ']].map(function (item) {
+        var el = document.getElementById(item[0]);
+        return { label: item[1], text: el ? el.innerText.trim() : '' };
+      }).filter(function (s) { return s.text; });
+      payload.summary = window._readingSummary || null;
+    }
+    if (!payload.sections.length || payload.sections.some(function (s) { return /ไม่สามารถโหลดข้อมูลได้/.test(s.text); })) {
+      alert('กรุณารอให้รายงานโหลดสำเร็จก่อนส่งอีเมล'); return;
+    }
+    sending = true;
+    try {
+      var response = await fetch('/api/sendmail', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      var result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || 'ส่งอีเมลไม่สำเร็จ');
+      if (notice) { notice.textContent = 'ระบบรับคำขอส่งอีเมลแล้ว กรุณาตรวจกล่องจดหมายและโฟลเดอร์สแปม'; notice.style.display = 'block'; }
+    } catch (error) { alert(error.message || 'ยังยืนยันผลการส่งไม่ได้ กรุณาตรวจกล่องจดหมายก่อนลองใหม่'); }
+    finally { sending = false; }
+  };
+})();
 </script></body></html>
