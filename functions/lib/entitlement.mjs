@@ -190,6 +190,32 @@ export async function markEventProcessed(env, eventId, eventType) {
   ).bind(eventId, eventType || null).run();
 }
 
+/**
+ * Park an event we could not finish. It is deliberately NOT recorded as
+ * processed: the payload is kept so it can be replayed, and the row stays open
+ * until something actually completes it. Nothing here decides that an event is
+ * hopeless -- that judgement belongs to a person looking at the open rows.
+ */
+export async function recordUnresolved(env, { eventId, eventType, chargeId, reason, payload }) {
+  await env.DB.prepare(
+    `INSERT INTO webhook_unresolved
+        (event_id, event_type, charge_id, reason, payload, attempts, first_seen_at, last_seen_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, 1, datetime('now'), datetime('now'))
+     ON CONFLICT(event_id) DO UPDATE SET
+        attempts     = attempts + 1,
+        last_seen_at = datetime('now'),
+        reason       = ?4`
+  ).bind(eventId, eventType || null, chargeId || null, reason, payload || null).run();
+}
+
+/** Close an open row once a later delivery got the job done. */
+export async function resolveUnresolved(env, eventId) {
+  await env.DB.prepare(
+    `UPDATE webhook_unresolved SET resolved_at = datetime('now')
+      WHERE event_id = ? AND resolved_at IS NULL`
+  ).bind(eventId).run();
+}
+
 export async function fetchPaymentIntent(env, chargeId) {
   const res = await fetch(`https://api.stripe.com/v1/payment_intents/${encodeURIComponent(chargeId)}`, {
     headers: { 'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}` }

@@ -41,10 +41,6 @@ export const OTP_POLICY = {
   defaultDailySmsCap: 20
 };
 
-// How long after a code was accepted the interrupted-issue recovery path may
-// be used. Long enough that a person retrying qualifies, short enough that a
-// concurrent sibling request never does.
-const RECOVERY_MIN_AGE_SECONDS = 10;
 
 // Digits from a CSPRNG — not Math.random, which is predictable and would make
 // codes guessable from earlier ones.
@@ -262,9 +258,7 @@ export async function consumeChallengeByPublicId(env, { publicId, codeHash, cand
   if (changesOf(attempt) === 0) return { ok: false, reason: 'not_attemptable' };
 
   const row = await env.DB.prepare(
-    `SELECT id, code_hash, consumed_at, issued_token, token_applied,
-            (consumed_at IS NOT NULL
-             AND consumed_at <= datetime('now', '-${RECOVERY_MIN_AGE_SECONDS} seconds')) AS recoverable
+    `SELECT id, code_hash, consumed_at, issued_token, token_applied
        FROM otp_challenges WHERE public_id = ? LIMIT 1`
   ).bind(publicId).first();
   if (!row) return { ok: false, reason: 'not_found' };
@@ -274,14 +268,15 @@ export async function consumeChallengeByPublicId(env, { publicId, codeHash, cand
   // Recovery path: this code was already accepted, but the token never reached
   // the payment row. Hand back the same token and let the caller finish.
   //
-  // `recoverable` is what keeps this from firing on a sibling request that is
-  // simply a few milliseconds behind: mid-flight, a run that has consumed the
-  // code but not yet written the token looks exactly like a run that died. The
-  // age check separates them, because a real retry is a person submitting the
-  // form again and is never this fast. Without it, two simultaneous submissions
-  // both answer 200 -- with the same token and one grant, so nothing is
-  // over-issued, but "this code worked twice" is not a thing to leave true.
-  if (Number(row.recoverable) === 1 && Number(row.token_applied) === 0 && row.issued_token) {
+  // There is deliberately no time window here. A clock cannot tell a run that
+  // died from a run that is merely slow -- a stalled request is still stalled
+  // after ten seconds, or ten minutes -- so the safety is not in WHEN this
+  // fires but in what the write itself is allowed to do: see applyTokenToOrder,
+  // which refuses any challenge that is no longer the newest for that number.
+  // A duplicate submission racing the original therefore gets the SAME token
+  // back, never a second one, and a stalled older request can never land on top
+  // of a token issued since.
+  if (row.consumed_at && Number(row.token_applied) === 0 && row.issued_token) {
     return { ok: true, challengeId: row.id, token: row.issued_token, replay: true };
   }
 
@@ -295,11 +290,58 @@ export async function consumeChallengeByPublicId(env, { publicId, codeHash, cand
   return { ok: true, challengeId: row.id, token: candidateToken, replay: false };
 }
 
-/** Mark the issued token as delivered to `payments`, and stop storing it. */
-export async function markTokenApplied(env, challengeId) {
+/**
+ * Write this challenge's token onto the order -- in ONE statement that re-checks,
+ * at the moment of writing, that the challenge is still allowed to write.
+ *
+ * This is the control that makes concurrency safe, and it is a write condition
+ * rather than a timer. Two guards live in the WHERE clause:
+ *
+ *   token_applied = 0   this challenge has not already been applied, so a
+ *                       replay cannot write twice.
+ *   no newer challenge  the number has not been sent a newer code since. A
+ *                       request that stalled -- for ten seconds or ten minutes,
+ *                       the duration is irrelevant -- and resumes after the
+ *                       customer already recovered with a newer code will find
+ *                       this false and write nothing, instead of silently
+ *                       replacing the token they are holding.
+ *
+ * Because the check and the write are the same statement, nothing can change
+ * between them.
+ */
+export async function applyTokenToOrder(env, { publicId, orderId, token }) {
+  const res = await env.DB.prepare(
+    `UPDATE payments
+        SET token = ?1
+      WHERE id = ?2
+        AND EXISTS (
+              SELECT 1 FROM otp_challenges c
+               WHERE c.public_id = ?3
+                 AND c.token_applied = 0
+                 AND NOT EXISTS (
+                       SELECT 1 FROM otp_challenges n
+                        WHERE n.phone_hash = c.phone_hash
+                          AND n.id > c.id
+                          AND n.send_status IN ('sent', 'unknown')))`
+  ).bind(token, orderId, publicId).run();
+
+  if (changesOf(res) === 0) return { applied: false };
+
+  // Only now stop holding the token on the challenge. If the worker dies
+  // between these two statements the token is already on the order, and the
+  // retry simply finds token_applied still 0, rewrites the same value, and
+  // finishes -- which changes nothing.
   await env.DB.prepare(
-    `UPDATE otp_challenges SET token_applied = 1, issued_token = NULL WHERE id = ?`
-  ).bind(challengeId).run();
+    `UPDATE otp_challenges SET token_applied = 1, issued_token = NULL WHERE public_id = ?`
+  ).bind(publicId).run();
+  return { applied: true };
+}
+
+/** Close out a challenge that will never hand its token over. */
+export async function abandonIssuedToken(env, publicId) {
+  await env.DB.prepare(
+    `UPDATE otp_challenges SET token_applied = 1, issued_token = NULL WHERE public_id = ?`
+  ).bind(publicId).run();
 }
 
 /** The phone hash a challenge was created for — used to find the order. */

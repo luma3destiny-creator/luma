@@ -36,6 +36,7 @@ function freshDb(paidPhones) {
   const { raw } = openD1(DBFILE);
   raw.exec(fs.readFileSync(path.join(HERE, 'schema.sql'), 'utf8'));
   raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '004_webhook_events.sql'), 'utf8'));
+  raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '007_webhook_unresolved.sql'), 'utf8'));
   raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '005_otp_challenges.sql'), 'utf8'));
   raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '006_preview_test_outbox.sql'), 'utf8'));
   for (const p of paidPhones) {
@@ -77,6 +78,11 @@ function orderRow(chargeId) {
   return read((raw) => raw.prepare(
     `SELECT status, token, paid_at, expires_at FROM payments WHERE charge_id = ?`
   ).get(chargeId));
+}
+
+function unresolvedRows() {
+  return read((raw) => raw.prepare(
+    `SELECT event_id, reason, attempts, payload, resolved_at FROM webhook_unresolved`).all());
 }
 
 function eventRows() {
@@ -464,9 +470,11 @@ console.log('\n--- real SQLite, real parallel processes, mock SMS --------------
 
   const news = await burst(Array.from({ length: 6 }, () => ['verify', phone, codeB, pubB]), { CAP: '20' });
   const wins = news.filter(r => r.body && r.body.ok && r.body.token);
-  check('6 simultaneous attempts with the live code → exactly 1 success', wins.length === 1,
-        'successes=' + wins.length);
-  check('…and the payment row holds that one token',
+  const distinct = new Set(wins.map(r => r.body.token));
+  check('6 simultaneous attempts with the live code yield at most ONE token value',
+        wins.length >= 1 && distinct.size === 1,
+        'successes=' + wins.length + ' distinct=' + distinct.size);
+  check('…and the payment row holds exactly that token',
         read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token
           === wins[0].body.token);
 }
@@ -638,14 +646,35 @@ console.log('\n--- real SQLite, real parallel processes, mock SMS --------------
   check('…the order is paid', orderRow(CH).status === 'paid');
 }
 
-// ── 26. an orphan event does not retry forever ────────────────────────────
+// ── 26. an orphan event is parked, never closed out on a guess ────────────
+// The earlier version decided, from the event's age alone, that the order was
+// never coming and recorded it as processed. Nothing in this code can know
+// that, and being wrong means the event is dead forever.
 {
   freshDb([]);
-  const old = await burst([['webhook', 'pi_wh_never', 'evt_orphan_1', '5900', '7200']]);
-  check('an event still orphaned after the grace period is closed out, not retried',
-        old[0].status === 200 && old[0].body === 'no matching order',
-        'status=' + old[0].status + ' body=' + old[0].body);
-  check('…and it is recorded so Stripe stops', eventRows().length === 1);
+  const CH = 'pi_wh_orphan';
+  const a = await burst([['webhook', CH, 'evt_orphan_1', '5900', '7200']]);
+  check('an old orphan is still refused, not closed out on its age',
+        a[0].status === 500, 'status=' + a[0].status);
+  check('…it is NEVER recorded as processed', eventRows().length === 0);
+  let open = unresolvedRows();
+  check('…it is parked as unresolved instead', open.length === 1 && open[0].reason === 'no_order');
+  check('…with the payload kept so it can be replayed',
+        !!open[0].payload && String(open[0].payload).includes('evt_orphan_1'));
+
+  await burst([['webhook', CH, 'evt_orphan_1', '5900', '7200']]);
+  open = unresolvedRows();
+  check('…and a further delivery counts an attempt rather than duplicating the row',
+        open.length === 1 && Number(open[0].attempts) === 2, 'attempts=' + open[0].attempts);
+  check('…still open', !open[0].resolved_at);
+
+  // the order finally appears — the parked event must now be able to complete
+  seedPendingOrder(CH);
+  const done = await burst([['webhook', CH, 'evt_orphan_1', '5900', '7200']]);
+  check('once the order exists, the parked event completes for real',
+        done[0].status === 200 && done[0].body === 'ok', 'status=' + done[0].status);
+  check('…the order is paid', orderRow(CH).status === 'paid');
+  check('…and the unresolved row is closed', !!unresolvedRows()[0].resolved_at);
 }
 
 // ── 27. a wrong amount never entitles, and never retries ──────────────────
@@ -658,6 +687,66 @@ console.log('\n--- real SQLite, real parallel processes, mock SMS --------------
         res[0].status === 200 && String(res[0].body).indexOf('not entitled') === 0,
         'body=' + res[0].body);
   check('…and grants nothing', orderRow(CH).status === 'pending' && !orderRow(CH).token);
+}
+
+
+// ── 28. a stalled request cannot land on top of a newer token ─────────────
+// The control is the WRITE, not a clock. This case stalls the first request at
+// the exact moment before it writes, lets the customer recover with a newer
+// code, waits past any plausible timeout, and only then lets the old request
+// finish its write.
+{
+  const phone = '0877000001';
+  freshDb([phone]);
+  const E164 = '66877000001';
+  await burst([['request', phone, '10.28.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const codeA = codeFor(E164);
+  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+
+  // request A gets as far as accepting the code and reserving its token…
+  await burst([['verify-crash', phone, codeA, pubA]], { CAP: '20' });
+  check('the stalled request did reserve a token',
+        !!read((raw) => raw.prepare(`SELECT issued_token FROM otp_challenges WHERE public_id=?`).get(pubA)).issued_token);
+
+  // …and stays stalled well past any timeout anyone might have reached for.
+  ageConsumed(600);
+
+  // meanwhile the customer asks again and recovers normally
+  ageChallenges(70);
+  await burst([['request', phone, '10.28.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const codeB = codeFor(E164);
+  const pubB = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+  const good = await burst([['verify', phone, codeB, pubB]], { CAP: '20' });
+  check('the newer code issues a token', good[0].status === 200 && good[0].body.ok);
+  const live = read((raw) => raw.prepare(`SELECT id, token FROM payments WHERE phone=?`).get(phone));
+
+  // now the stalled request resumes, right at its write
+  const late = await burst([['apply-stalled', pubA, String(live.id), 'token-from-stalled-request']], { CAP: '20' });
+  check('the stalled write is refused even after ten minutes',
+        late[0] && late[0].applied === false, JSON.stringify(late[0]));
+  check('…and the token the customer is holding is untouched',
+        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token === live.token);
+  check('…which is the newer one, not the stalled one',
+        live.token !== 'token-from-stalled-request');
+}
+
+// ── 29. the same challenge cannot write its token twice ───────────────────
+{
+  const phone = '0877000002';
+  freshDb([phone]);
+  const E164 = '66877000002';
+  await burst([['request', phone, '10.29.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const code = codeFor(E164);
+  const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+  const ok = await burst([['verify', phone, code, pub]], { CAP: '20' });
+  const live = read((raw) => raw.prepare(`SELECT id, token FROM payments WHERE phone=?`).get(phone));
+  check('the code issued a token', ok[0].status === 200 && live.token === ok[0].body.token);
+
+  const again = await burst([['apply-stalled', pub, String(live.id), 'second-write']], { CAP: '20' });
+  check('a second write from the same challenge is refused',
+        again[0] && again[0].applied === false, JSON.stringify(again[0]));
+  check('…and the token is unchanged',
+        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token === live.token);
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed   (real SQLite file, ' +

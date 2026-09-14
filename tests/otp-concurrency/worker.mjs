@@ -4,7 +4,7 @@ import { onRequestPost as requestOtp } from '../../functions/api/request-otp.js'
 import { onRequestPost as verifyOtp }  from '../../functions/api/verify-otp.js';
 import { onRequestGet as checkAccess }  from '../../functions/api/check-access.js';
 import { onRequestPost as stripeWebhook } from '../../functions/api/stripe-webhook.js';
-import { hashPhone, hashCode, consumeChallengeByPublicId } from '../../functions/lib/otp.mjs';
+import { hashPhone, hashCode, consumeChallengeByPublicId, applyTokenToOrder } from '../../functions/lib/otp.mjs';
 
 const [, , file, op, ...rest] = process.argv;
 const { DB } = openD1(file);
@@ -79,6 +79,12 @@ try {
       env
     });
     out = { status: res.status, body: await res.json() };
+  } else if (op === 'apply-stalled') {
+    // A request that consumed its code and then STALLED, resuming at the exact
+    // moment it would write the token. Nothing about elapsed time is involved:
+    // this is the write step itself, arriving late.
+    const [publicId, orderId, token] = rest;
+    out = await applyTokenToOrder(env, { publicId, orderId: Number(orderId), token });
   } else if (op === 'webhook') {
     // chargeId, eventId, [amount], [createdOffsetSeconds]
     const [chargeId, eventId, amountArg, offsetArg] = rest;

@@ -11,7 +11,8 @@
 // grant — see consumeChallengeByPublicId.
 
 import { hashCode, hashPhone, toE164Thai, toLocalThai,
-         consumeChallengeByPublicId, markTokenApplied, challengePhoneHash } from '../lib/otp.mjs';
+         consumeChallengeByPublicId, applyTokenToOrder, abandonIssuedToken,
+         challengePhoneHash } from '../lib/otp.mjs';
 
 export async function onRequestOptions() { return cors(null, 204); }
 
@@ -69,15 +70,22 @@ export async function onRequestPost(context) {
     // A correct code for a number with no live entitlement. Nothing to hand
     // over, and the same message as every other rejection.
     if (!row) {
-      await markTokenApplied(env, result.challengeId);   // stop holding a token we will not use
+      await abandonIssuedToken(env, challengeId);   // stop holding a token we will not use
       return json({ ok: false, error: 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว' }, 401);
     }
 
-    // Rotate the token: whoever just proved ownership gets the one reserved for
-    // this challenge, and any token a previous holder had stops working. Writing
-    // the same value twice (after a crash-and-retry) is a no-op, not a regrant.
-    await env.DB.prepare(`UPDATE payments SET token = ? WHERE id = ?`).bind(result.token, row.id).run();
-    await markTokenApplied(env, result.challengeId);
+    // Rotate the token. The write re-checks, in the same statement, that this
+    // challenge is still the newest for the number and has not already been
+    // applied -- so a request that stalled and resumed after the customer
+    // recovered with a newer code writes nothing rather than replacing the
+    // token they are now holding.
+    const applied = await applyTokenToOrder(env, {
+      publicId: challengeId, orderId: row.id, token: result.token
+    });
+    if (!applied.applied) {
+      console.log('verify-otp: refused a token write that is no longer current');
+      return json({ ok: false, error: 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว' }, 401);
+    }
 
     if (result.replay) console.log('verify-otp: completed a token issue that was interrupted earlier');
     return json({ ok: true, token: result.token, expiresAt: row.expires_at });

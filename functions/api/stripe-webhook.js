@@ -23,16 +23,11 @@
 // endpoint's secret will never validate live-mode events, and mixing them is
 // exactly how a test payment ends up granting real access.
 
-import { validatePaymentIntent, grantEntitlementOnce, isEventProcessed, markEventProcessed } from '../lib/entitlement.mjs';
+import { validatePaymentIntent, grantEntitlementOnce, isEventProcessed, markEventProcessed,
+         recordUnresolved, resolveUnresolved } from '../lib/entitlement.mjs';
 
 const DEFAULT_TOLERANCE_SECONDS = 300; // Stripe's own default; never set to 0
 
-// How long an event is allowed to arrive BEFORE the order row it belongs to.
-// PromptPay events can beat our own INSERT by a moment, and Stripe retries for
-// about three days, so a young orphan is asked for again rather than dropped.
-// Past this age the order is never going to appear, and retrying forever helps
-// nobody — it is recorded, answered 200, and logged for a human.
-const ORDER_GRACE_SECONDS = 3600;
 
 export async function onRequestPost(context) {
   const { request, env } = context;
@@ -91,17 +86,17 @@ export async function onRequestPost(context) {
 
     // The event can genuinely arrive before we have written the order row.
     // Answering 200 here would throw the event away and leave a paid customer
-    // with nothing, so a young one is refused so Stripe delivers it again.
+    // with nothing. Nothing in this code can know whether the order is seconds
+    // behind or never coming, so it does not guess: the event is parked as
+    // UNRESOLVED, with its payload, and refused so Stripe delivers it again.
+    // It is never recorded as processed, so a later delivery -- Stripe's own
+    // retry, a Resend from the Dashboard, or a replay of the stored payload --
+    // runs it for real instead of being answered "duplicate ignored".
     if (!order) {
-      const createdAt = Number(event.created) || 0;
-      const ageSeconds = createdAt ? Math.floor(Date.now() / 1000) - createdAt : 0;
-      if (createdAt && ageSeconds > ORDER_GRACE_SECONDS) {
-        console.error('stripe-webhook: no order for this payment intent after ' +
-                      ageSeconds + 's — giving up, needs a human');
-        await markEventProcessed(env, eventId, eventType);
-        return text('no matching order', 200);
-      }
-      console.warn('stripe-webhook: order row not written yet — asking Stripe to retry');
+      await recordUnresolved(env, {
+        eventId, eventType, chargeId, reason: 'no_order', payload: rawBody
+      });
+      console.warn('stripe-webhook: no order row for this event yet — parked as unresolved');
       return text('order not ready', 500);
     }
 
@@ -117,9 +112,13 @@ export async function onRequestPost(context) {
     const grant = await grantEntitlementOnce(env, chargeId);
     if (!grant.ok) {
       if (grant.code === 'ENTITLEMENT_INCOMPLETE') {
-        // A data problem a retry cannot fix. Finished, and loud.
-        console.error('stripe-webhook: order needs manual review');
-        await markEventProcessed(env, eventId, eventType);
+        // A data problem a retry cannot fix, so Stripe is told to stop — but it
+        // is NOT recorded as processed, because it is not done. It stays in the
+        // unresolved table until a person deals with it, and can be replayed.
+        await recordUnresolved(env, {
+          eventId, eventType, chargeId, reason: 'entitlement_incomplete', payload: rawBody
+        });
+        console.error('stripe-webhook: order needs manual review — parked as unresolved');
         return text('needs manual review', 200);
       }
       // Our own failure. Nothing is recorded, so the retry runs the whole thing
@@ -132,6 +131,7 @@ export async function onRequestPost(context) {
     // grant, which is idempotent: granted comes back false and the event
     // completes normally, without a second entitlement.
     await markEventProcessed(env, eventId, eventType);
+    await resolveUnresolved(env, eventId);   // closes it if it was parked earlier
 
     // No token in the response. The customer collects it from /api/verify or
     // the recovery flow, both of which authenticate the caller.
