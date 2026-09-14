@@ -208,6 +208,24 @@ export async function recordSendOutcome(env, challengeId, { provider, status, re
  * guards live in the WHERE clause, so concurrent submissions cannot overspend
  * the attempt budget or redeem one code twice.
  *
+ * ONLY THE NEWEST CODE WORKS. Asking for a new code has to retire the previous
+ * one, or "resend" leaves two live codes for the same number and the older one
+ * still opens the account. This is enforced as a CONDITION AT VERIFY TIME --
+ * "refuse if a newer delivered challenge exists for this phone" -- rather than
+ * by marking the old row when the new one is created. That choice matters: a
+ * second write could be lost to a crash between the two statements, leaving the
+ * old code alive, which is the bug itself. As a condition there is no window at
+ * all, and no schema change.
+ *
+ * Only a newer challenge the provider ACCEPTED ('sent') or that may have gone
+ * out ('unknown') retires an older one. A send the provider REFUSED never
+ * reached the customer, so it must not take away the code they are holding --
+ * that would strand them for no reason. A request that was throttled creates no
+ * row and so retires nothing.
+ *
+ * The same condition is what stops an older challenge from overwriting a newer
+ * token: only the newest challenge can ever reach `payments`.
+ *
  * CRASH WINDOW. Consuming the code and writing the new token onto the payment
  * row are two different writes, and the worker can die between them. If that
  * happened and the code were simply burned, the customer would have paid, held
@@ -228,7 +246,12 @@ export async function consumeChallengeByPublicId(env, { publicId, codeHash, cand
       WHERE public_id = ?
         AND expires_at > datetime('now')
         AND attempts < ?
-        AND (consumed_at IS NULL OR token_applied = 0)`
+        AND (consumed_at IS NULL OR token_applied = 0)
+        AND NOT EXISTS (
+              SELECT 1 FROM otp_challenges AS newer
+               WHERE newer.phone_hash = otp_challenges.phone_hash
+                 AND newer.id > otp_challenges.id
+                 AND newer.send_status IN ('sent', 'unknown'))`
   ).bind(publicId, OTP_POLICY.maxAttemptsPerCode).run();
 
   if (changesOf(attempt) === 0) return { ok: false, reason: 'not_attemptable' };

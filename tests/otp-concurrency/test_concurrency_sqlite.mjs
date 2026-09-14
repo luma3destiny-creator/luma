@@ -46,6 +46,18 @@ function freshDb(paidPhones) {
   raw.close();
 }
 
+
+// Move every challenge's created_at back, so the 60s cooldown and the hourly
+// counters behave as if that much time had passed. expires_at is deliberately
+// NOT moved: the point of these cases is an OLD code that is still inside its
+// 5-minute lifetime and must be refused anyway, because a newer one exists.
+function ageChallenges(seconds) {
+  const { raw } = openD1(DBFILE);
+  try {
+    raw.prepare(`UPDATE otp_challenges SET created_at = datetime(created_at, '-${seconds} seconds')`).run();
+  } finally { raw.close(); }
+}
+
 function read(fn) {
   const { raw, DB } = openD1(DBFILE);
   try { return fn(raw, DB); } finally { raw.close(); }
@@ -320,6 +332,167 @@ console.log('\n--- real SQLite, real parallel processes, mock SMS --------------
   const stranger = await burst([['check-access', 'not-a-real-token']]);
   check('a token nobody was issued is refused',
         !(stranger[0].body && stranger[0].body.ok), JSON.stringify(stranger[0].body));
+}
+
+
+// ── 14. asking for a new code retires the old one ──────────────────────────
+// The bug this closes: request A, wait out the cooldown, request B -- and A's
+// code still opened the account. Two live codes for one number is one code too
+// many.
+{
+  const phone = '0866000001';
+  freshDb([phone]);
+  const E164 = '66866000001';
+  await burst([['request', phone, '10.14.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const codeA = codeFor(E164);
+  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+
+  ageChallenges(70);   // past the cooldown
+  await burst([['request', phone, '10.14.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const codeB = codeFor(E164);
+  const pubB = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+  check('the resend produced a different code and challenge',
+        codeA !== codeB && pubA !== pubB);
+
+  const oldTry = await burst([['verify', phone, codeA, pubA]], { CAP: '20' });
+  check('the OLD code is refused once a new one has been sent',
+        oldTry[0].status === 401, 'status=' + oldTry[0].status);
+  check('…and the old attempt rotated nothing',
+        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token
+          === 'old-token-' + phone);
+  check('…and it did not even spend an attempt on the retired challenge',
+        Number(read((raw) => raw.prepare(`SELECT attempts FROM otp_challenges WHERE public_id=?`).get(pubA)).attempts) === 0);
+
+  const newTry = await burst([['verify', phone, codeB, pubB]], { CAP: '20' });
+  check('the NEW code still works', newTry[0].status === 200 && newTry[0].body.ok);
+}
+
+// ── 15. a resend the provider REFUSED must not retire the working code ─────
+{
+  const phone = '0866000002';
+  freshDb([phone]);
+  const E164 = '66866000002';
+  await burst([['request', phone, '10.15.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const codeA = codeFor(E164);
+  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+
+  ageChallenges(70);
+  // brevo with no API key: refused before anything leaves. Nothing was delivered,
+  // so the customer is still holding codeA and must not be stranded.
+  await burst([['request', phone, '10.15.0.1']], { CAP: '20', SMS_PROVIDER: 'brevo' });
+  check('the failed resend is recorded as failed',
+        read((raw) => raw.prepare(`SELECT send_status FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).send_status === 'failed');
+
+  const stillWorks = await burst([['verify', phone, codeA, pubA]], { CAP: '20' });
+  check('a resend that never went out does NOT retire the code in hand',
+        stillWorks[0].status === 200 && stillWorks[0].body.ok, 'status=' + stillWorks[0].status);
+}
+
+// ── 16. a resend with no reply DOES retire the old code ───────────────────
+// 'unknown' means it may well have been delivered. Leaving the old one alive on
+// that guess is the same two-live-codes bug, so the safe reading wins.
+{
+  const phone = '0866000003';
+  freshDb([phone]);
+  const E164 = '66866000003';
+  await burst([['request', phone, '10.16.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const codeA = codeFor(E164);
+  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+
+  ageChallenges(70);
+  await burst([['request', phone, '10.16.0.1']],
+              { CAP: '20', SMS_PROVIDER: 'brevo', BREVO_API_KEY: 'k', SMS_SENDER_ID: 'LUMA', SIMULATE_TIMEOUT: 'true' });
+  check('the no-reply resend is recorded as unknown',
+        read((raw) => raw.prepare(`SELECT send_status FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).send_status === 'unknown');
+
+  const oldTry = await burst([['verify', phone, codeA, pubA]], { CAP: '20' });
+  check('a resend that may have gone out DOES retire the old code',
+        oldTry[0].status === 401, 'status=' + oldTry[0].status);
+}
+
+// ── 17. retiring survives simultaneous attempts ───────────────────────────
+{
+  const phone = '0866000004';
+  freshDb([phone]);
+  const E164 = '66866000004';
+  await burst([['request', phone, '10.17.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const codeA = codeFor(E164);
+  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+  ageChallenges(70);
+  await burst([['request', phone, '10.17.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const codeB = codeFor(E164);
+  const pubB = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+
+  const olds = await burst(Array.from({ length: 6 }, () => ['verify', phone, codeA, pubA]), { CAP: '20' });
+  check('6 simultaneous attempts with the retired code all fail',
+        olds.every(r => r.status === 401), JSON.stringify(olds.map(r => r.status)));
+
+  const news = await burst(Array.from({ length: 6 }, () => ['verify', phone, codeB, pubB]), { CAP: '20' });
+  const wins = news.filter(r => r.body && r.body.ok && r.body.token);
+  check('6 simultaneous attempts with the live code → exactly 1 success', wins.length === 1,
+        'successes=' + wins.length);
+  check('…and the payment row holds that one token',
+        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token
+          === wins[0].body.token);
+}
+
+// ── 18. an interrupted issue still completes when nothing newer exists ─────
+{
+  const phone = '0866000005';
+  freshDb([phone]);
+  const E164 = '66866000005';
+  await burst([['request', phone, '10.18.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const code = codeFor(E164);
+  const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+
+  await burst([['verify-crash', phone, code, pub]], { CAP: '20' });
+  const retry = await burst([['verify', phone, code, pub]], { CAP: '20' });
+  check('crash recovery still works when no newer code was sent',
+        retry[0].status === 200 && retry[0].body.token === 'tok-from-crashed-run',
+        'status=' + retry[0].status);
+}
+
+// ── 19. an interrupted issue cannot overwrite a newer token ───────────────
+// The dangerous shape: the customer gives up on the interrupted code, asks for
+// a new one, succeeds -- and then the stale reserved token gets applied on top,
+// silently logging them out.
+{
+  const phone = '0866000006';
+  freshDb([phone]);
+  const E164 = '66866000006';
+  await burst([['request', phone, '10.19.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const codeA = codeFor(E164);
+  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+  await burst([['verify-crash', phone, codeA, pubA]], { CAP: '20' });
+
+  ageChallenges(70);
+  await burst([['request', phone, '10.19.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const codeB = codeFor(E164);
+  const pubB = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+  const good = await burst([['verify', phone, codeB, pubB]], { CAP: '20' });
+  check('the new code issues a token normally', good[0].status === 200 && good[0].body.ok);
+  const current = read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token;
+
+  const stale = await burst([['verify', phone, codeA, pubA]], { CAP: '20' });
+  check('the interrupted older code is refused afterwards',
+        stale[0].status === 401, 'status=' + stale[0].status);
+  check('…and the newer token was NOT overwritten',
+        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token === current);
+  check('…and no second token was handed out', !(stale[0].body && stale[0].body.token));
+}
+
+// ── 20. expiry is unchanged by any of this ────────────────────────────────
+{
+  const phone = '0866000007';
+  freshDb([phone]);
+  const before = read((raw) => raw.prepare(`SELECT expires_at FROM payments WHERE phone=?`).get(phone)).expires_at;
+  const E164 = '66866000007';
+  await burst([['request', phone, '10.20.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
+  const code = codeFor(E164);
+  const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
+  await burst([['verify', phone, code, pub]], { CAP: '20' });
+  check('recovering access never moves the entitlement expiry date',
+        read((raw) => raw.prepare(`SELECT expires_at FROM payments WHERE phone=?`).get(phone)).expires_at === before);
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed   (real SQLite file, ' +
