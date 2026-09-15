@@ -1,3 +1,4 @@
+import { checkPaidAccess } from '../lib/paid-access.mjs';
 // functions/api/analyze-vision.js — Claude Vision for face & palm reading
 
 export async function onRequestOptions() {
@@ -18,6 +19,7 @@ export async function onRequestPost(context) {
     return json({ error: 'Invalid JSON' }, 400);
   }
 
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ error: 'Invalid payload' }, 400);
   const { imageBase64, mediaType, mode, personName, token } = body;
   if (!imageBase64 || !mode) return json({ error: 'ข้อมูลไม่ครบ' }, 400);
 
@@ -147,38 +149,6 @@ ${guardrails}
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-
-// Returns { ok:true } only when `token` maps to a row this database says is
-// paid and unexpired. Every other outcome — including an unusable database —
-// returns ok:false, so the caller denies the request instead of proceeding.
-async function checkPaidAccess(env, token) {
-  if (!env.DB) {
-    console.error('analyze-vision: no DB binding — denying');
-    return { ok: false, status: 503, error: 'ระบบตรวจสอบสิทธิ์ไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่ภายหลัง' };
-  }
-  if (!token || typeof token !== 'string' || !token.trim()) {
-    return { ok: false, status: 402, error: 'กรุณาปลดล็อคแพ็กเกจก่อนใช้งานส่วนนี้' };
-  }
-
-  let row;
-  try {
-    row = await env.DB.prepare(
-      `SELECT id, expires_at FROM payments WHERE token = ? AND status = 'paid' LIMIT 1`
-    ).bind(token.trim()).first();
-  } catch (e) {
-    // Fail closed: an entitlement we cannot verify is an entitlement we refuse.
-    console.error('analyze-vision: entitlement lookup failed — denying:', e);
-    return { ok: false, status: 503, error: 'ระบบตรวจสอบสิทธิ์ไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่ภายหลัง' };
-  }
-
-  if (!row) return { ok: false, status: 402, error: 'กรุณาปลดล็อคแพ็กเกจก่อนใช้งานส่วนนี้' };
-
-  if (row.expires_at && new Date(row.expires_at + 'Z') < new Date()) {
-    return { ok: false, status: 402, error: 'สิทธิ์การใช้งานหมดอายุแล้ว กรุณาต่ออายุ' };
-  }
-
-  return { ok: true };
-}
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {

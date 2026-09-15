@@ -39,8 +39,19 @@ test('timeout displays recovery message',async()=>{
 test('older response cannot overwrite latest result or send a second email',async()=>{
   const resolves=[]; const h=harness(()=>new Promise(resolve=>resolves.push(resolve)));
   h.nodes.bemail.value='test@example.com';
-  const first=h.window.loadReading({}); const second=h.window.loadReading({});
+  const first=h.window.loadReading({personName:'first'}); const second=h.window.loadReading({personName:'second'});
   resolves[1](new Response(JSON.stringify({ok:true,reading}))); await second;
   resolves[0](new Response(JSON.stringify({ok:true,reading:{...reading,career:'old'}}))); await first;
   assert.equal(h.nodes.careerText.textContent,'งาน'); assert.equal(h.window._readingReady,true); assert.equal(h.emails(),1);
+});
+test('same input reuses pending and completed requests without another email',async()=>{
+  let calls=0, resolve;
+  const h=harness(()=>{calls++; return new Promise(r=>{resolve=r;});});
+  h.nodes.bemail.value='test@example.com';
+  const first=h.window.loadReading({personName:'same'});
+  await h.window.loadReading({personName:'same'});
+  assert.equal(calls,1);
+  resolve(new Response(JSON.stringify({ok:true,reading}))); await first;
+  await h.window.loadReading({personName:'same'});
+  assert.equal(calls,1); assert.equal(h.emails(),1); assert.equal(h.window._readingReady,true);
 });

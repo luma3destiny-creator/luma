@@ -1,3 +1,4 @@
+import { checkPaidAccess } from '../lib/paid-access.mjs';
 // functions/api/compat.js — Cloudflare Pages Function
 
 export async function onRequestOptions() {
@@ -20,66 +21,16 @@ export async function onRequestPost(context) {
     return json({ error: 'Invalid JSON' }, 400);
   }
 
-  const { person1, person2, chargeId, token } = body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ error: 'Invalid payload' }, 400);
+  const { person1, person2, token } = body;
 
   if (!person1?.name || !person1?.birthDate || !person2?.name || !person2?.birthDate) {
     return json({ error: 'ข้อมูลไม่ครบ กรุณาระบุชื่อและวันเกิดของทั้งสองคน' }, 400);
   }
 
-  if (!chargeId && !token) {
-    return json({ error: 'กรุณาชำระเงินก่อนดูผลดวง' }, 402);
-  }
-
-  // Dev bypass REMOVED (`chargeId === 'dev' || token === 'dev-token'` used to
-  // skip the whole entitlement check). Every request now goes through the
-  // real check below. Prices and existing paid customers are unaffected.
-  {
-    let authorized = false;
-
-    // Preferred: validate the persistent access token — same check as
-    // /api/check-access, so returning users (restored via localStorage or
-    // phone recovery) are authorized here too, not just a just-completed payment.
-    if (token && env.DB) {
-      try {
-        const row = await env.DB.prepare(
-          `SELECT id, expires_at FROM payments WHERE token = ? AND status = 'paid' LIMIT 1`
-        ).bind(token).first();
-        if (row && !(row.expires_at && new Date(row.expires_at + 'Z') < new Date())) {
-          authorized = true;
-        }
-      } catch (e) {
-        console.error('compat token check failed:', e);
-      }
-    }
-
-    // Fallback: legacy check for a charge just completed in this same session.
-    if (!authorized && chargeId) {
-      if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) {
-        console.warn('Redis not configured — skipping legacy chargeId check');
-      } else {
-        const key = encodeURIComponent('session:' + chargeId);
-        const getUrl = `${env.UPSTASH_REDIS_REST_URL}/get/${key}`;
-
-        let tokenValue = null;
-        try {
-          const getRes = await fetch(getUrl, {
-            headers: { 'Authorization': `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}` }
-          });
-          const getData = await getRes.json();
-          tokenValue = getData.result;
-        } catch (e) {
-          console.error('Redis GET failed:', e);
-        }
-
-        if (tokenValue) authorized = true;
-        // session key ไม่ลบ — ใช้ซ้ำได้ตลอด session (TTL 1h)
-      }
-    }
-
-    if (!authorized) {
-      return json({ error: 'การชำระเงินยังไม่สำเร็จ หรือสิทธิ์หมดอายุแล้ว กรุณาลองใหม่' }, 402);
-    }
-  }
+  const access = await checkPaidAccess(env, token);
+  if (!access.ok) return json({ error: access.error }, access.status);
+  if (!env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 503);
 
   const g1 = person1.gender === 'm' ? 'ชาย' : 'หญิง';
   const g2 = person2.gender === 'm' ? 'ชาย' : 'หญิง';

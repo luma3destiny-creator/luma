@@ -1156,10 +1156,14 @@ if("1"===new URLSearchParams(location.search).get("dev")){
 // BEGIN reading loader
 (function () {
   var active = null;
+  var cache = new Map(); // Page-memory only: no personal reports in persistent storage.
   var fields = { career: 'careerText', money: 'moneyText', health: 'healthText', love: 'loveText', spirit: 'spiritText' };
   window.loadReading = async function (payload) {
+    var key = JSON.stringify(Object.keys(payload).sort().map(function (name) { return [name, payload[name]]; }));
+    if (active && active.readingKey === key) return;
     if (active) active.abort();
     var controller = new AbortController();
+    controller.readingKey = key;
     active = controller;
     window._readingReady = false;
     window._readingSummary = null;
@@ -1170,6 +1174,20 @@ if("1"===new URLSearchParams(location.search).get("dev")){
       });
     }
     display('กำลังวิเคราะห์...');
+    function render(reading) {
+      Object.keys(fields).forEach(function (name) {
+        var el = document.getElementById(fields[name]);
+        if (el) el.textContent = reading[name];
+      });
+      window._readingSummary = reading.summary || null;
+      window._readingReady = true;
+    }
+    var saved = cache.get(key);
+    if (saved && Date.now() - saved.at < 600000) {
+      render(saved.reading);
+      active = null;
+      return; // Reopening a result must not send another automatic email.
+    }
     var timer = setTimeout(function () { controller.abort(); }, 45000);
     try {
       var response = await fetch('/api/generate-reading', {
@@ -1187,12 +1205,10 @@ if("1"===new URLSearchParams(location.search).get("dev")){
         throw new Error('ผลวิเคราะห์ไม่ครบ กรุณาลองคำนวณใหม่ภายหลัง');
       }
       if (active !== controller) return;
-      Object.keys(fields).forEach(function (key) {
-        var el = document.getElementById(fields[key]);
-        if (el) el.textContent = reading[key];
-      });
-      window._readingSummary = reading.summary || null;
-      window._readingReady = true;
+      cache.delete(key);
+      cache.set(key, { reading: reading, at: Date.now() });
+      if (cache.size > 5) cache.delete(cache.keys().next().value);
+      render(reading);
       if (((document.getElementById('bemail') || {}).value || '').trim()) window.sendByEmail('reading');
     } catch (error) {
       if (active !== controller) return;
