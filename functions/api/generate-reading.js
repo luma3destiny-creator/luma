@@ -27,7 +27,7 @@ export async function onRequestPost(context) {
   } = body;
 
   if (!env.ANTHROPIC_API_KEY) {
-    return json({ error: 'AI ยังไม่พร้อม กรุณาติดต่อผู้ดูแล' }, 500);
+    return json({ error: 'ระบบวิเคราะห์ AI ยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแล', code: 'AI_NOT_CONFIGURED' }, 503);
   }
 
   const name = personName || 'คุณ';
