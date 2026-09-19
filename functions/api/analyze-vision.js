@@ -1,5 +1,5 @@
 import { checkPaidAccess } from '../lib/paid-access.mjs';
-import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
+import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText, boundedString } from '../lib/ai-quota.mjs';
 
 // The provider accepts images up to about 5 MB; base64 adds a third. A body
 // larger than this is not a photo anyone needs read, and forwarding it would
@@ -30,7 +30,9 @@ export async function onRequestPost(context) {
     return json({ error: 'รูปภาพมีขนาดใหญ่เกินไป' }, 413);
   }
   if (mode !== 'face' && mode !== 'palm') return json({ error: 'mode ไม่ถูกต้อง' }, 400);
-  if (!boundedText(personName, 100).ok || !boundedText(mediaType, 40).ok) {
+  // mediaType must be a string: it is lower-cased below, and a number there
+  // would throw instead of being refused.
+  if (!boundedText(personName, 100).ok || !boundedString(mediaType, 40).ok) {
     return json({ error: 'ข้อมูลไม่ถูกต้อง' }, 400);
   }
 

@@ -7,15 +7,16 @@
 // through it. What it does not prove: anything about Cloudflare D1's own
 // scheduling (documented to serialise writes, not measured here), the real
 // cf-connecting-ip header on Cloudflare, or the provider's real billing.
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { openD1 } from '../otp-concurrency/d1.mjs';
 
-const run = promisify(execFile);
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+// fileURLToPath, not URL.pathname: on Windows the pathname is "/D:/Luma/..."
+// and path.join turns it into "D:\D:\Luma\...".
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..', '..');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'luma-aiq-'));
 const DBFILE = path.join(TMP, 'aiq.sqlite');
@@ -34,7 +35,7 @@ function freshDb({ quotaTable = true } = {}) {
   for (const f of fs.readdirSync(TMP)) fs.rmSync(path.join(TMP, f), { force: true });
   const { raw } = openD1(DBFILE);
   raw.exec(fs.readFileSync(path.join(HERE, '..', 'otp-concurrency', 'schema.sql'), 'utf8'));
-  if (quotaTable) raw.exec(fs.readFileSync(path.join(ROOT, 'migrations', '008_ai_quota.sql'), 'utf8'));
+  if (quotaTable) raw.exec(fs.readFileSync(path.join(ROOT, 'migrations', '009_ai_quota.sql'), 'utf8'));
   const ins = raw.prepare(
     `INSERT INTO payments (id, phone, name, charge_id, amount, status, token, paid_at, expires_at)
      VALUES (?, ?, ?, ?, 5900, ?, ?, datetime('now'), ?)`);
@@ -62,15 +63,33 @@ const BODIES = {
   'analyze-vision':     (token) => ({ token, imageBase64: 'aGVsbG8=', mediaType: 'image/png', mode: 'face', personName: 'ทดสอบ' })
 };
 
-// Fire requests at once, each in its own process.
+// Run each request in its own process. All of them boot, open the database and
+// build their request, report READY, and wait; only when EVERY one has reported
+// does the parent release them together. `overlap` is how many were actually
+// held at the gate at the same moment -- the evidence that they collided.
+let lastOverlap = 0;
 async function burst(specs, env = {}) {
-  // All workers release at the same instant, after every one has booted.
-  const START_AT = String(Date.now() + 2500);
-  return Promise.all(specs.map(([route, body, ip]) =>
-    run(process.execPath, [path.join(HERE, 'worker.mjs'), DBFILE, route, bodyFile(body), ip || '-'],
-        { env: { ...process.env, ...BASE_ENV, ...env, START_AT }, maxBuffer: 16 * 1024 * 1024 })
-      .then(r => JSON.parse(r.stdout))
-      .catch(e => { try { return JSON.parse(e.stdout); } catch { return { status: 'crashed', error: String(e.stderr || e.message).slice(0, 300), aiCalls: 0 }; } })));
+  const children = specs.map(([route, body, ip]) => {
+    const child = spawn(process.execPath,
+      [path.join(HERE, 'worker.mjs'), DBFILE, route, bodyFile(body), ip || '-'],
+      { env: { ...process.env, ...BASE_ENV, ...env, BARRIER: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    const ready = new Promise((resolve) => {
+      child.stdout.on('data', (d) => { out += d; if (out.includes('READY\n')) resolve(); });
+      child.on('exit', resolve);   // never hang the gate on a worker that died
+    });
+    child.stderr.on('data', (d) => { err += d; });
+    const done = new Promise((resolve) => child.on('exit', () => {
+      const line = out.split('\n').find((l) => l.startsWith('RESULT '));
+      if (line) resolve(JSON.parse(line.slice(7)));
+      else resolve({ status: 'crashed', error: err.slice(0, 300), aiCalls: 0 });
+    }));
+    return { child, ready, done, isReady: () => out.includes('READY\n') };
+  });
+  await Promise.all(children.map((c) => c.ready));
+  lastOverlap = children.filter((c) => c.isReady() && c.child.exitCode === null).length;
+  for (const c of children) { try { c.child.stdin.write('GO\n'); c.child.stdin.end(); } catch {} }
+  return Promise.all(children.map((c) => c.done));
 }
 const sum = (rs) => rs.reduce((n, r) => n + (r.aiCalls || 0), 0);
 const count = (rs, s) => rs.filter(r => r.status === s).length;
@@ -85,6 +104,7 @@ console.log('\n--- AI quota: real handlers, real SQLite, parallel processes, stu
   check('10 simultaneous free readings from one IP, limit 3 → exactly 3 reach the AI', sum(rs) === 3, 'ai=' + sum(rs));
   check('…the other 7 get 429', count(rs, 429) === 7, JSON.stringify(rs.map(r => r.status)));
   check('…and exactly 3 slots are recorded', rows().length === 3, 'rows=' + rows().length);
+  check('…and all 10 workers were held at the gate together before release', lastOverlap === 10, 'overlap=' + lastOverlap);
 }
 
 // ── 2. free global ceiling holds across different IPs ──────────────────────
@@ -246,6 +266,58 @@ console.log('\n--- AI quota: real handlers, real SQLite, parallel processes, stu
   check('the refused request gets a Thai message', !!limited && /ลองใหม่ภายหลัง/.test(limited.body.error), JSON.stringify(limited));
   check('…a Retry-After header', !!limited && !!limited.retryAfter);
   check('…and the server made no attempt of its own for it', !!limited && limited.aiCalls === 0);
+}
+
+
+// ── 14. a body with no Content-Length is cut off at the cap, not buffered ──
+{
+  freshDb();
+  const big = JSON.stringify({ ...BODIES['generate-reading'](), padding: 'x'.repeat(100 * 1024) });
+  const r = (await burst([['generate-reading', big, '203.0.113.150']], { STREAM_BODY: '1' }))[0];
+  check('a 100 KB chunked body with no Content-Length → 413', r.status === 413, 'status=' + r.status);
+  check('…reading stopped at the cap: at most 9 of ~100 chunks pulled',
+        r.chunksPulled > 0 && r.chunksPulled <= 9, 'pulled=' + r.chunksPulled + ' of ' + Math.ceil(r.bodyBytes / 1024));
+  check('…no slot and no AI call', rows().length === 0 && r.aiCalls === 0);
+  const small = (await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.151']], { STREAM_BODY: '1' }))[0];
+  check('a normal chunked body with no Content-Length still works', small.status === 200, 'status=' + small.status);
+}
+
+// ── 15. a non-string mediaType is refused, not a crash ─────────────────────
+{
+  freshDb();
+  const rs = await burst([
+    ['analyze-vision', { ...BODIES['analyze-vision']('tok-A'), mediaType: 123 }],
+    ['analyze-vision', { ...BODIES['analyze-vision']('tok-A'), mediaType: { x: 1 } }]
+  ]);
+  check('mediaType as a number or object → 400, not a 500',
+        rs.every((r) => r.status === 400), JSON.stringify(rs.map((r) => r.status)));
+  check('…no slot and no AI call', rows().length === 0 && sum(rs) === 0);
+}
+
+// ── 16. legacy /api/reading: a refusal no longer destroys the paid token ───
+{
+  const LEG = { UPSTASH_REDIS_REST_URL: 'https://upstash.mock', UPSTASH_REDIS_REST_TOKEN: 'x' };
+  freshDb();
+  let r = (await burst([['reading', BODIES.reading(), '203.0.113.160']], { ...LEG, NO_API_KEY: '1' }))[0];
+  check('no API key → 503, and the one-time token is NOT consumed',
+        r.status === 503 && r.redisDeletes === 0 && r.aiCalls === 0, JSON.stringify(r).slice(0, 160));
+
+  freshDb();
+  r = (await burst([['reading', BODIES.reading(), '203.0.113.161']], { ...LEG, NO_IP_SECRET: '1' }))[0];
+  check('quota system not ready → 503, and the token is NOT consumed',
+        r.status === 503 && r.redisDeletes === 0 && r.aiCalls === 0, JSON.stringify(r).slice(0, 160));
+
+  freshDb();
+  const IP = '203.0.113.162';
+  await burst([['generate-reading', BODIES['generate-reading'](), IP]], { ...LEG, AI_QUOTA_FREE_PER_IP: '1' });
+  r = (await burst([['reading', BODIES.reading(), IP]], { ...LEG, AI_QUOTA_FREE_PER_IP: '1' }))[0];
+  check('over the quota → 429, and the token is NOT consumed',
+        r.status === 429 && r.redisDeletes === 0 && r.aiCalls === 0, JSON.stringify(r).slice(0, 160));
+
+  freshDb();
+  r = (await burst([['reading', BODIES.reading(), '203.0.113.163']], LEG))[0];
+  check('an accepted request consumes the token exactly once, then calls the AI',
+        r.status === 200 && r.redisDeletes === 1 && r.aiCalls === 1, JSON.stringify(r).slice(0, 160));
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed   (real handlers, real SQLite file, parallel processes, stub AI provider — 0 real AI calls)\n');

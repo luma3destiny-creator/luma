@@ -3,6 +3,13 @@
 // quota (per Cloudflare client IP, plus the free ceiling) and cannot be used
 // to get around it. It has no payments-table entitlement to count per payment,
 // which is why it sits in the free budget. See functions/lib/ai-quota.mjs.
+//
+// KNOWN GAP, NOT FIXED HERE: this route also sends email through Resend
+// directly (below), OUTSIDE the email-send quota that /api/sendmail enforces.
+// The AI quota bounds how many readings it can generate, and therefore how
+// many of those emails it can send, but it is not an email limit and the
+// email cost is not counted anywhere. Retiring this route closes it; that is
+// a decision to make once traffic to it is confirmed to be zero.
 import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
 
 export async function onRequestOptions() {
@@ -37,6 +44,7 @@ export async function onRequestPost(context) {
   }
 
   // Dev bypass REMOVED (`chargeId === 'dev'` used to skip the check entirely).
+  let redisKey = null;   // set once the one-time token has been seen; consumed later
   {
     if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) {
       // FAIL CLOSED. This used to `console.warn` and then fall through,
@@ -64,16 +72,12 @@ export async function onRequestPost(context) {
         return json({ error: 'การชำระเงินยังไม่สำเร็จ กรุณารอสักครู่แล้วลองใหม่' }, 402);
       }
 
-      // ลบ token ใช้ได้ครั้งเดียว
-      try {
-        const delUrl = `${env.UPSTASH_REDIS_REST_URL}/del/${key}`;
-        await fetch(delUrl, {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}` }
-        });
-      } catch (e) {
-        console.error('Redis DEL failed:', e);
-      }
+      // The one-time token is NOT consumed here. It used to be deleted at this
+      // point -- before the API key was checked and before a quota slot was
+      // reserved -- so a request refused for either reason still destroyed
+      // the customer's paid entitlement. It is now consumed only once this
+      // request is certain to reach the AI; see consumeRedisToken below.
+      redisKey = key;
     }
   }
 
@@ -130,6 +134,24 @@ export async function onRequestPost(context) {
 
   const quota = await reserveAiCall(env, { bucket: 'free', route: 'reading', request });
   if (!quota.ok) return quotaResponse(quota);
+
+  // Only now -- key present, slot reserved, the AI is about to be called --
+  // is the one-time token spent. Every refusal above leaves it intact.
+  //
+  // Still not atomic with the check above: two requests racing on the same
+  // token can both pass the GET before either DEL. The AI quota bounds what
+  // that can cost; making it exact needs GETDEL, which would consume the token
+  // before the refusals above, the very thing this change removes.
+  if (redisKey) {
+    try {
+      await fetch(`${env.UPSTASH_REDIS_REST_URL}/del/${redisKey}`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}` }
+      });
+    } catch (e) {
+      console.error('Redis DEL failed:', e);
+    }
+  }
 
   let reading;
   try {

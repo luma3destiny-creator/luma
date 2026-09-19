@@ -214,25 +214,68 @@ function deny(status, code, error, retryAfter) {
 // ── request size ─────────────────────────────────────────────────────────────
 
 /**
- * Parse a JSON body without reading more than maxBytes. A large body costs
- * little to receive but a lot to forward: most of these routes paste the input
- * straight into the prompt, so an oversized field is an oversized bill.
+ * Parse a JSON body without ever holding more than maxBytes of it.
+ *
+ * A large body costs little to receive but a lot to forward: most of these
+ * routes paste the input straight into the prompt. Content-Length is checked
+ * first as a cheap early refusal, but it is advisory -- it can be absent
+ * (chunked uploads) or simply wrong -- so the stream itself is read chunk by
+ * chunk, bytes are counted as they arrive, and reading STOPS the moment the
+ * count passes the cap. request.text() would buffer the whole thing first and
+ * only then let us look, which is the cost we are trying not to pay.
+ *
  * Returns { ok:true, body } or { ok:false, response }.
  */
 export async function readJsonBody(request, maxBytes) {
-  const declared = Number(request.headers && request.headers.get && request.headers.get('content-length'));
-  if (Number.isFinite(declared) && declared > maxBytes) return { ok: false, response: tooLarge() };
-  let text;
-  try { text = await request.text(); } catch { return { ok: false, response: badJson() }; }
-  // Content-Length can be absent or wrong, so the real size decides.
-  if (new TextEncoder().encode(text).length > maxBytes) return { ok: false, response: tooLarge() };
+  const declared = request.headers && request.headers.get ? request.headers.get('content-length') : null;
+  if (declared !== null && declared !== undefined && declared !== '') {
+    const n = Number(declared);
+    if (Number.isFinite(n) && n > maxBytes) return { ok: false, response: tooLarge() };
+  }
+
+  const stream = request.body;
+  if (!stream) return { ok: false, response: badJson() };
+
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        // Stop pulling from the client and drop what we have.
+        try { await reader.cancel(); } catch { /* already closing */ }
+        return { ok: false, response: tooLarge() };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: false, response: badJson() };
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { bytes.set(c, offset); offset += c.byteLength; }
+
   let body;
-  try { body = JSON.parse(text); } catch { return { ok: false, response: badJson() }; }
+  try { body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
+  catch { return { ok: false, response: badJson() }; }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { ok: false, response: badJson() };
   return { ok: true, body };
 }
 
-/** A string field no longer than max, or empty. Anything else is refused. */
+/** A STRING no longer than max, or absent. Numbers are refused: use this for any
+ *  field the code later calls string methods on. */
+export function boundedString(value, max) {
+  if (value === undefined || value === null) return { ok: true, value: '' };
+  if (typeof value !== 'string') return { ok: false };
+  return value.length <= max ? { ok: true, value } : { ok: false };
+}
+
+/** A text field no longer than max, or empty. Accepts strings and numbers,
+ *  because it is only ever interpolated into a prompt. Anything else is refused. */
 export function boundedText(value, max) {
   if (value === undefined || value === null) return { ok: true, value: '' };
   if (typeof value !== 'string' && typeof value !== 'number') return { ok: false };

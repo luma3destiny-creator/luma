@@ -1,7 +1,7 @@
--- migrations/008_ai_quota.sql
+-- migrations/009_ai_quota.sql
 -- Additive only. Deletes nothing. Does not touch `payments`. Safe to re-run.
 --
---   npx wrangler d1 execute luma-db-preview --remote --file=migrations/008_ai_quota.sql
+--   npx wrangler d1 execute luma-db-preview --remote --file=migrations/009_ai_quota.sql
 --
 -- One row per AI call that was ALLOWED to reach the provider. Requests turned
 -- away (over the limit, invalid input, no entitlement, no API key) leave no row.
