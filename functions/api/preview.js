@@ -31,9 +31,6 @@ export async function onRequestPost(context) {
         .every(([v, max]) => boundedText(v, max).ok)) {
     return json({ error: 'ข้อมูลไม่ถูกต้อง' }, 400);
   }
-  // This route never checked for the key: without one it would still have
-  // reached the provider. Refuse before anything is reserved.
-  if (!env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 503);
 
   const genderText = gender === 'm' ? 'ชาย' : 'หญิง';
 
@@ -68,6 +65,9 @@ export async function onRequestPost(context) {
   // asks for it without permission is refused here, before any quota.
   const aiMode = await resolveAiMode(env, request);
   if (aiMode.mode === 'refuse') return aiMode.response;
+  // The real path needs the provider key and is refused here, before any
+  // quota is reserved. Test mode never calls the provider, so it does not.
+  if (aiMode.mode === 'real' && !env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 503);
 
   const quota = await reserveAiCall(env, { bucket: 'free', route: 'preview', request });
   if (!quota.ok) return quotaResponse(quota);

@@ -52,7 +52,6 @@ export async function onRequestPost(context) {
   const access = await checkPaidAccess(env, token);
   if (!access.ok) return json({ ok: false, error: access.error }, access.status);
 
-  if (!env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 500);
 
   const validTypes = ['image/jpeg','image/png','image/gif','image/webp'];
   const rawType = (mediaType || '').toLowerCase().replace('image/jpg','image/jpeg');
@@ -122,6 +121,9 @@ ${guardrails}
   // asks for it without permission is refused here, before any quota.
   const aiMode = await resolveAiMode(env, request);
   if (aiMode.mode === 'refuse') return aiMode.response;
+  // The real path needs the provider key and is refused here, before any
+  // quota is reserved. Test mode never calls the provider, so it does not.
+  if (aiMode.mode === 'real' && !env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 500);
 
   const quota = await reserveAiCall(env, { bucket: 'paid', route: 'analyze-vision', paymentId: access.paymentId });
   if (!quota.ok) return quotaResponse(quota);

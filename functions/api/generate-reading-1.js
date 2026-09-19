@@ -37,9 +37,6 @@ export async function onRequestPost(context) {
     dominant, wealthEl, healthEl, personName
   } = body;
 
-  if (!env.ANTHROPIC_API_KEY) {
-    return json({ error: 'AI ยังไม่พร้อม กรุณาติดต่อผู้ดูแล' }, 500);
-  }
 
   const name = personName || 'คุณ';
 
@@ -76,6 +73,11 @@ export async function onRequestPost(context) {
   // asks for it without permission is refused here, before any quota.
   const aiMode = await resolveAiMode(env, request);
   if (aiMode.mode === 'refuse') return aiMode.response;
+  // The real path needs the provider key and is refused here, before any
+  // quota is reserved. Test mode never calls the provider, so it does not.
+  if (aiMode.mode === 'real' && !env.ANTHROPIC_API_KEY) {
+    return json({ error: 'AI ยังไม่พร้อม กรุณาติดต่อผู้ดูแล' }, 500);
+  }
 
   const quota = await reserveAiCall(env, { bucket: 'free', route: 'generate-reading-1', request });
   if (!quota.ok) return quotaResponse(quota);

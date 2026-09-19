@@ -130,13 +130,14 @@ export async function onRequestPost(context) {
 
 ห้ามใช้เครื่องหมาย # หรือ * หรือ - เด็ดขาด ใช้ตัวอักษรธรรมดาเท่านั้น`;
 
-  // This route never checked for the key. Refuse before anything is reserved.
-  if (!env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 503);
 
   // Test mode is decided by the SERVER (see ai-provider.mjs). A request that
   // asks for it without permission is refused here, before any quota.
   const aiMode = await resolveAiMode(env, request);
   if (aiMode.mode === 'refuse') return aiMode.response;
+  // The real path needs the provider key and is refused here, before any
+  // quota is reserved. Test mode never calls the provider, so it does not.
+  if (aiMode.mode === 'real' && !env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 503);
 
   const quota = await reserveAiCall(env, { bucket: 'free', route: 'reading', request });
   if (!quota.ok) return quotaResponse(quota);

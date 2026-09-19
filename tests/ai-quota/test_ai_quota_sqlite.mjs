@@ -462,6 +462,64 @@ const isLabelled = (r) => JSON.stringify(r.body).includes('ข้อมูลท
         before.status === 200 && after.status === 403 && after.aiCalls === 0, before.status + ' → ' + after.status);
 }
 
+
+// ── 24. REGRESSION (found on Preview at 0b57434): test mode without an API key ─
+// The key was checked BEFORE the test mode was resolved, so an approved
+// test-mode request on a deployment with no provider key got 503
+// AI_NOT_CONFIGURED. Test mode never calls the provider and must not need the
+// key; the real path still must, and must refuse before reserving.
+{
+  const LEG = { UPSTASH_REDIS_REST_URL: 'https://upstash.mock', UPSTASH_REDIS_REST_TOKEN: 'x', RESEND_API_KEY: 'stub' };
+  const ALL6 = (ipBase) => [
+    ['generate-reading',   BODIES['generate-reading'](),   ipBase + '1'],
+    ['generate-reading-1', BODIES['generate-reading-1'](), ipBase + '2'],
+    ['preview',            BODIES.preview(),               ipBase + '3'],
+    ['reading',            { ...BODIES.reading(), email: 'someone@example.com' }, ipBase + '4'],
+    ['compat',             BODIES.compat('tok-A')],
+    ['analyze-vision',     BODIES['analyze-vision']('tok-B')]
+  ];
+  const statuses = (rs) => JSON.stringify(rs.map(r => r.status));
+  const emails = (rs) => rs.reduce((n, r) => n + (r.emailsSent || 0), 0);
+
+  // a) approved test mode, NO key → every route answers with a canned result
+  freshDb({ previewSwitch: 'on' });
+  let rs = await burst(ALL6('203.0.113.19'), { ...LEG, ...MOCK_ON, NO_API_KEY: '1' });
+  check('test mode with NO API key: all 6 routes answer 200 with a labelled test result',
+        rs.every(r => r.status === 200 && r.body.mock === true && isLabelled(r)), statuses(rs));
+  check('…exactly 6 quota rows, all outcome "mock"',
+        rows().length === 6 && rows().every(x => x.outcome === 'mock'), 'rows=' + rows().length);
+  check('…0 provider calls and 0 emails', sum(rs) === 0 && emails(rs) === 0, 'ai=' + sum(rs) + ' email=' + emails(rs));
+
+  // b) test mode asked for but NOT approved, NO key → refused, nothing happens
+  freshDb({ previewSwitch: 'on' });
+  rs = await burst(ALL6('203.0.113.20'), { ...LEG, ...MOCK_ON, SEND_MOCK_HEADER: 'wrong-secret', NO_API_KEY: '1' });
+  check('refused test mode with NO API key: all 6 routes answer 403',
+        rs.every(r => r.status === 403), statuses(rs));
+  check('…0 quota rows, 0 provider calls, 0 emails, no test result',
+        rows().length === 0 && sum(rs) === 0 && emails(rs) === 0 && !rs.some(isLabelled),
+        'rows=' + rows().length + ' ai=' + sum(rs));
+
+  // c) the real path with NO key → refused before reserving, on every route
+  freshDb({ previewSwitch: 'on' });
+  rs = await burst(ALL6('203.0.113.21'), { ...LEG, NO_API_KEY: '1' });
+  check('real path with NO API key: all 6 routes refuse with 5xx',
+        rs.every(r => r.status === 503 || r.status === 500), statuses(rs));
+  check('…free reading still reports AI_NOT_CONFIGURED', rs[0].body.code === 'AI_NOT_CONFIGURED', JSON.stringify(rs[0].body));
+  check('…0 quota rows, 0 provider calls, 0 emails',
+        rows().length === 0 && sum(rs) === 0 && emails(rs) === 0, 'rows=' + rows().length + ' ai=' + sum(rs));
+  check('…and the legacy route did not consume its one-time token', rs[3].redisDeletes === 0, 'dels=' + rs[3].redisDeletes);
+
+  // d) test mode without a key still enforces entitlement and input checks
+  freshDb({ previewSwitch: 'on' });
+  rs = await burst([['compat', BODIES.compat('not-a-real-token')],
+                    ['analyze-vision', { ...BODIES['analyze-vision']('tok-A'), mediaType: 7 }],
+                    ['generate-reading', { personName: 'x'.repeat(101) }, '203.0.113.22']],
+                   { ...MOCK_ON, NO_API_KEY: '1' });
+  check('test mode with no key still refuses a bad token (402) and bad input (400)',
+        rs[0].status === 402 && rs[1].status === 400 && rs[2].status === 400, statuses(rs));
+  check('…before reserving anything', rows().length === 0 && sum(rs) === 0);
+}
+
 console.log('\n' + pass + ' passed, ' + fail + ' failed   (real handlers, real SQLite file, parallel processes, stub AI provider — 0 real AI calls)\n');
 fs.rmSync(TMP, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);
