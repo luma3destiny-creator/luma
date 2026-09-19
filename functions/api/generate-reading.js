@@ -92,30 +92,50 @@ export async function onRequestPost(context) {
   if (!quota.ok) return quotaResponse(quota);
 
   try {
-    let res;
-    try {
-      res = await callAiProvider(aiMode, 'generate-reading', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-5',
-        max_tokens: 2800,
-        thinking: { type: 'disabled' },
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
-    } catch (e) {
-      await recordAiOutcome(env, quota.reservationId, 'unknown');
-      throw e;
-    }
-    await recordAiOutcome(env, quota.reservationId,
-      aiMode.mode === 'mock' ? 'mock' : (res.ok ? 'ok' : 'provider_error'));
+  const aiStartedAt = Date.now();
+let aiHeadersAt;
+let res;
 
-    const data = await res.json();
+try {
+  res = await callAiProvider(aiMode, 'generate-reading', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-5',
+      max_tokens: 2800,
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'user', content: prompt }]
+    })
+  });
+  aiHeadersAt = Date.now();
+} catch (e) {
+  await recordAiOutcome(env, quota.reservationId, 'unknown');
+  throw e;
+}
+
+await recordAiOutcome(
+  env,
+  quota.reservationId,
+  aiMode.mode === 'mock'
+    ? 'mock'
+    : (res.ok ? 'ok' : 'provider_error')
+);
+
+const data = await res.json();
+
+console.log('reading_ai_metrics', JSON.stringify({
+  mode: aiMode.mode,
+  status: res.status,
+  headers_ms: aiHeadersAt - aiStartedAt,
+  body_ready_ms: Date.now() - aiStartedAt,
+  stop_reason: data.stop_reason ?? null,
+  input_tokens: data.usage?.input_tokens ?? null,
+  output_tokens: data.usage?.output_tokens ?? null
+}));
 
     if (!res.ok) {
       console.error('Claude API error:', JSON.stringify(data));
