@@ -11,6 +11,7 @@
 // email cost is not counted anywhere. Retiring this route closes it; that is
 // a decision to make once traffic to it is confirmed to be zero.
 import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
+import { resolveAiMode, callAiProvider } from '../lib/ai-provider.mjs';
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -132,6 +133,11 @@ export async function onRequestPost(context) {
   // This route never checked for the key. Refuse before anything is reserved.
   if (!env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 503);
 
+  // Test mode is decided by the SERVER (see ai-provider.mjs). A request that
+  // asks for it without permission is refused here, before any quota.
+  const aiMode = resolveAiMode(env, request);
+  if (aiMode.mode === 'refuse') return aiMode.response;
+
   const quota = await reserveAiCall(env, { bucket: 'free', route: 'reading', request });
   if (!quota.ok) return quotaResponse(quota);
 
@@ -157,7 +163,7 @@ export async function onRequestPost(context) {
   try {
     let claudeRes;
     try {
-      claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      claudeRes = await callAiProvider(aiMode, 'reading', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -175,7 +181,8 @@ export async function onRequestPost(context) {
       await recordAiOutcome(env, quota.reservationId, 'unknown');
       throw e;
     }
-    await recordAiOutcome(env, quota.reservationId, claudeRes.ok ? 'ok' : 'provider_error');
+    await recordAiOutcome(env, quota.reservationId,
+      aiMode.mode === 'mock' ? 'mock' : (claudeRes.ok ? 'ok' : 'provider_error'));
 
     if (!claudeRes.ok) {
       return json({ error: 'ไม่สามารถเชื่อมต่อ AI ได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง' }, 502);
@@ -187,8 +194,9 @@ export async function onRequestPost(context) {
     return json({ error: 'เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่' }, 502);
   }
 
-  // ส่งอีเมลผ่าน Resend
-  if (email && env.RESEND_API_KEY) {
+  // ส่งอีเมลผ่าน Resend — never in test mode: a canned answer must not be mailed to anyone.
+  const sendEmail = !!(email && env.RESEND_API_KEY) && aiMode.mode !== 'mock';
+  if (sendEmail) {
     try {
       await fetch('https://api.resend.com/emails', {
         method: 'POST',
@@ -208,7 +216,7 @@ export async function onRequestPost(context) {
     }
   }
 
-  return json({ reading, emailSent: !!(email && env.RESEND_API_KEY) });
+  return json({ reading, emailSent: sendEmail, ...(aiMode.mode === 'mock' ? { mock: true } : {}) });
 }
 
 function json(data, status = 200) {

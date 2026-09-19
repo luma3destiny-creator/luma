@@ -3,6 +3,7 @@
 // against the free AI quota like /api/generate-reading and cannot be used to
 // get around it. See functions/lib/ai-quota.mjs.
 import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
+import { resolveAiMode, callAiProvider } from '../lib/ai-provider.mjs';
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -63,13 +64,18 @@ export async function onRequestPost(context) {
 
 เขียนเฉพาะส่วน "บุคลิกภาพและพลังงานชีวิต" ของคนนี้ เป็นภาษาไทย 3-4 ประโยค อ่านง่าย ราวกับนักโหราศาสตร์นั่งคุยด้วยตรงๆ อ้างอิงข้อมูลดาวด้านบนให้ชัดเจน บอกตรงๆ ทั้งจุดแข็งและจุดที่ต้องระวัง ห้ามใช้เครื่องหมาย # หรือ * หรือ - เด็ดขาด ใช้ตัวอักษรธรรมดาเท่านั้น ไม่ต้องใส่หัวข้อ`;
 
+  // Test mode is decided by the SERVER (see ai-provider.mjs). A request that
+  // asks for it without permission is refused here, before any quota.
+  const aiMode = resolveAiMode(env, request);
+  if (aiMode.mode === 'refuse') return aiMode.response;
+
   const quota = await reserveAiCall(env, { bucket: 'free', route: 'preview', request });
   if (!quota.ok) return quotaResponse(quota);
 
   try {
     let claudeRes;
     try {
-      claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      claudeRes = await callAiProvider(aiMode, 'preview', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -87,7 +93,8 @@ export async function onRequestPost(context) {
       await recordAiOutcome(env, quota.reservationId, 'unknown');
       throw e;
     }
-    await recordAiOutcome(env, quota.reservationId, claudeRes.ok ? 'ok' : 'provider_error');
+    await recordAiOutcome(env, quota.reservationId,
+      aiMode.mode === 'mock' ? 'mock' : (claudeRes.ok ? 'ok' : 'provider_error'));
 
     if (!claudeRes.ok) {
       return json({ error: 'ไม่สามารถเชื่อมต่อ AI ได้' }, 502);
@@ -95,7 +102,7 @@ export async function onRequestPost(context) {
 
     const claudeData = await claudeRes.json();
     const preview = ((claudeData.content || []).find(function(b){ return b.type === 'text'; }) || {}).text || '';
-    return json({ preview });
+    return json({ preview, ...(aiMode.mode === 'mock' ? { mock: true } : {}) });
   } catch (e) {
     return json({ error: 'เกิดข้อผิดพลาด กรุณาลองใหม่' }, 502);
   }

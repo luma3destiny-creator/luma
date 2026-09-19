@@ -320,6 +320,97 @@ console.log('\n--- AI quota: real handlers, real SQLite, parallel processes, stu
         r.status === 200 && r.redisDeletes === 1 && r.aiCalls === 1, JSON.stringify(r).slice(0, 160));
 }
 
+
+// ════ Preview test mode: the provider call is replaced, nothing else is ══════
+// A fake secret that exists only in this test file. The real one lives only in
+// Cloudflare's Preview variables.
+const TEST_SECRET = 'test-only-mock-secret-0123456789abcdef';
+const MOCK_ON = { AI_MOCK_ENV: 'preview', AI_MOCK_SECRET: TEST_SECRET, SEND_MOCK_HEADER: TEST_SECRET };
+const isLabelled = (r) => JSON.stringify(r.body).includes('ข้อมูลทดสอบ');
+
+// ── 17. correctly enabled: canned answer, real D1 quota, no provider call ───
+{
+  freshDb();
+  const r = (await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.170']], MOCK_ON))[0];
+  check('test mode: 200 with a canned answer', r.status === 200 && r.body.ok === true, JSON.stringify(r).slice(0, 160));
+  check('…marked mock:true and labelled as test data in the text', r.body.mock === true && isLabelled(r));
+  check('…and the real provider was NOT called', r.aiCalls === 0, 'ai=' + r.aiCalls);
+  const rs = rows();
+  check('…but the SAME D1 quota slot was reserved, outcome "mock"',
+        rs.length === 1 && rs[0].outcome === 'mock' && rs[0].bucket === 'free', JSON.stringify(rs));
+}
+
+// ── 18. the cap holds in test mode exactly as it does for real ─────────────
+{
+  freshDb();
+  const rs = await burst(Array.from({ length: 6 }, () => ['generate-reading', BODIES['generate-reading'](), '203.0.113.171']),
+                         { ...MOCK_ON, AI_QUOTA_FREE_PER_IP: '2' });
+  check('6 simultaneous test-mode calls, limit 2 → exactly 2 answered, 4 × 429',
+        count(rs, 200) === 2 && count(rs, 429) === 4, JSON.stringify(rs.map(r => r.status)));
+  check('…2 rows recorded, 0 provider calls', rows().length === 2 && sum(rs) === 0, 'rows=' + rows().length + ' ai=' + sum(rs));
+}
+
+// ── 19. asking without permission: refused, nothing real, nothing canned ──
+{
+  const cases = [
+    ['wrong environment (AI_MOCK_ENV unset)',       { AI_MOCK_SECRET: TEST_SECRET, SEND_MOCK_HEADER: TEST_SECRET }],
+    ['wrong environment (AI_MOCK_ENV=production)',  { AI_MOCK_ENV: 'production', AI_MOCK_SECRET: TEST_SECRET, SEND_MOCK_HEADER: TEST_SECRET }],
+    ['no secret configured on the server',          { AI_MOCK_ENV: 'preview', SEND_MOCK_HEADER: TEST_SECRET }],
+    ['secret configured but too short',             { AI_MOCK_ENV: 'preview', AI_MOCK_SECRET: 'short', SEND_MOCK_HEADER: 'short' }],
+    ['wrong secret sent',                           { AI_MOCK_ENV: 'preview', AI_MOCK_SECRET: TEST_SECRET, SEND_MOCK_HEADER: TEST_SECRET + 'x' }],
+    ['empty header sent',                           { AI_MOCK_ENV: 'preview', AI_MOCK_SECRET: TEST_SECRET, SEND_MOCK_HEADER: '' }],
+  ];
+  for (const [name, env] of cases) {
+    freshDb();
+    const rs = await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.172'],
+                            ['compat', BODIES.compat('tok-A')]], env);
+    check(name + ': 403 on free and paid routes',
+          rs.every(r => r.status === 403), JSON.stringify(rs.map(r => r.status)));
+    check('…no real AI call, no canned answer, no quota row',
+          sum(rs) === 0 && !rs.some(isLabelled) && rows().length === 0,
+          'ai=' + sum(rs) + ' rows=' + rows().length);
+  }
+}
+
+// ── 20. no header: the real path, untouched, even with test mode enabled ──
+{
+  freshDb();
+  const r = (await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.173']],
+                         { AI_MOCK_ENV: 'preview', AI_MOCK_SECRET: TEST_SECRET }))[0];
+  check('without the header, the normal provider path runs (test mode is never the default)',
+        r.status === 200 && r.aiCalls === 1 && !r.body.mock, JSON.stringify(r).slice(0, 120));
+  check('…and its row is a real one, outcome "ok"', rows()[0] && rows()[0].outcome === 'ok');
+}
+
+// ── 21. paid routes: a bad token is refused before any quota ──────────────
+{
+  freshDb();
+  const rs = await burst([['compat', BODIES.compat('not-a-real-token')],
+                          ['analyze-vision', BODIES['analyze-vision']('tok-C')]], MOCK_ON);   // tok-C is pending
+  check('test mode with an unentitled token → 402 on both paid routes',
+        rs.every(r => r.status === 402), JSON.stringify(rs.map(r => r.status)));
+  check('…refused BEFORE reserving: no row, no call', rows().length === 0 && sum(rs) === 0);
+  const ok = await burst([['compat', BODIES.compat('tok-A')], ['analyze-vision', BODIES['analyze-vision']('tok-A')]], MOCK_ON);
+  check('test mode with a paid token → canned answers on both paid routes',
+        ok.every(r => r.status === 200 && r.body.mock === true && isLabelled(r)), JSON.stringify(ok.map(r => r.status)));
+  check('…counted per payment, outcome "mock", 0 provider calls',
+        rows().every(x => x.subject === 'pay:1' && x.outcome === 'mock') && rows().length === 2 && sum(ok) === 0);
+}
+
+// ── 22. test mode never sends email ───────────────────────────────────────
+{
+  const LEG = { UPSTASH_REDIS_REST_URL: 'https://upstash.mock', UPSTASH_REDIS_REST_TOKEN: 'x', RESEND_API_KEY: 'stub' };
+  const withEmail = () => ({ ...BODIES.reading(), email: 'someone@example.com' });
+  freshDb();
+  const real = (await burst([['reading', withEmail(), '203.0.113.174']], LEG))[0];
+  check('control: the legacy reading route does email on the real path', real.emailsSent === 1, 'emails=' + real.emailsSent);
+  freshDb();
+  const mock = (await burst([['reading', withEmail(), '203.0.113.175']], { ...LEG, ...MOCK_ON }))[0];
+  check('in test mode it sends NO email', mock.status === 200 && mock.emailsSent === 0 && mock.body.emailSent === false,
+        JSON.stringify(mock).slice(0, 160));
+  check('…and its answer is labelled test data', mock.body.mock === true && isLabelled(mock));
+}
+
 console.log('\n' + pass + ' passed, ' + fail + ' failed   (real handlers, real SQLite file, parallel processes, stub AI provider — 0 real AI calls)\n');
 fs.rmSync(TMP, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

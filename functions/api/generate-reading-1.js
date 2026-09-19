@@ -3,6 +3,7 @@
 // the SAME free AI quota as /api/generate-reading. It must never be a way
 // around that limit. See functions/lib/ai-quota.mjs.
 import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
+import { resolveAiMode, callAiProvider } from '../lib/ai-provider.mjs';
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -71,13 +72,18 @@ export async function onRequestPost(context) {
 - ตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่น:
 {"career":"...","money":"...","health":"...","love":"...","spirit":"..."}`;
 
+  // Test mode is decided by the SERVER (see ai-provider.mjs). A request that
+  // asks for it without permission is refused here, before any quota.
+  const aiMode = resolveAiMode(env, request);
+  if (aiMode.mode === 'refuse') return aiMode.response;
+
   const quota = await reserveAiCall(env, { bucket: 'free', route: 'generate-reading-1', request });
   if (!quota.ok) return quotaResponse(quota);
 
   try {
     let res;
     try {
-      res = await fetch('https://api.anthropic.com/v1/messages', {
+      res = await callAiProvider(aiMode, 'generate-reading-1', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -95,7 +101,8 @@ export async function onRequestPost(context) {
       await recordAiOutcome(env, quota.reservationId, 'unknown');
       throw e;
     }
-    await recordAiOutcome(env, quota.reservationId, res.ok ? 'ok' : 'provider_error');
+    await recordAiOutcome(env, quota.reservationId,
+      aiMode.mode === 'mock' ? 'mock' : (res.ok ? 'ok' : 'provider_error'));
 
     const data = await res.json();
 
@@ -120,7 +127,7 @@ export async function onRequestPost(context) {
       return json({ error: 'รูปแบบผลไม่ถูกต้อง' }, 500);
     }
 
-    return json({ ok: true, reading });
+    return json({ ok: true, reading, ...(aiMode.mode === 'mock' ? { mock: true } : {}) });
 
   } catch (e) {
     console.error('Generate reading failed:', e);

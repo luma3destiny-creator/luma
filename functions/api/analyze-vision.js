@@ -1,5 +1,6 @@
 import { checkPaidAccess } from '../lib/paid-access.mjs';
 import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText, boundedString } from '../lib/ai-quota.mjs';
+import { resolveAiMode, callAiProvider } from '../lib/ai-provider.mjs';
 
 // The provider accepts images up to about 5 MB; base64 adds a third. A body
 // larger than this is not a photo anyone needs read, and forwarding it would
@@ -117,13 +118,18 @@ ${guardrails}
 
   // Counted per PAYMENT, not per token, and shared with the couple reading:
   // one paid allowance per purchase. Reserved only now and never given back.
+  // Test mode is decided by the SERVER (see ai-provider.mjs). A request that
+  // asks for it without permission is refused here, before any quota.
+  const aiMode = resolveAiMode(env, request);
+  if (aiMode.mode === 'refuse') return aiMode.response;
+
   const quota = await reserveAiCall(env, { bucket: 'paid', route: 'analyze-vision', paymentId: access.paymentId });
   if (!quota.ok) return quotaResponse(quota);
 
   try {
     let res;
     try {
-      res = await fetch('https://api.anthropic.com/v1/messages', {
+      res = await callAiProvider(aiMode, 'analyze-vision', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -147,7 +153,8 @@ ${guardrails}
       await recordAiOutcome(env, quota.reservationId, 'unknown');
       throw e;
     }
-    await recordAiOutcome(env, quota.reservationId, res.ok ? 'ok' : 'provider_error');
+    await recordAiOutcome(env, quota.reservationId,
+      aiMode.mode === 'mock' ? 'mock' : (res.ok ? 'ok' : 'provider_error'));
 
     const data = await res.json();
     if (!res.ok) {
@@ -165,7 +172,7 @@ ${guardrails}
     try { result = JSON.parse(jsonMatch[0]); }
     catch { return json({ error: 'รูปแบบผลไม่ถูกต้อง' }, 500); }
 
-    return json({ ok: true, result, mode });
+    return json({ ok: true, result, mode, ...(aiMode.mode === 'mock' ? { mock: true } : {}) });
 
   } catch (e) {
     console.error('Vision analysis failed:', e);

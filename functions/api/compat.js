@@ -1,5 +1,6 @@
 import { checkPaidAccess } from '../lib/paid-access.mjs';
 import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
+import { resolveAiMode, callAiProvider } from '../lib/ai-provider.mjs';
 // functions/api/compat.js — Cloudflare Pages Function
 
 export async function onRequestOptions() {
@@ -88,6 +89,11 @@ ${SUMMARY_MARKER}
   // Counted per PAYMENT, not per token: recovering access issues a new token,
   // and that must not come with a fresh allowance. Reserved only now -- after
   // input, entitlement and key have all passed -- and never given back.
+  // Test mode is decided by the SERVER (see ai-provider.mjs). A request that
+  // asks for it without permission is refused here, before any quota.
+  const aiMode = resolveAiMode(env, request);
+  if (aiMode.mode === 'refuse') return aiMode.response;
+
   const quota = await reserveAiCall(env, { bucket: 'paid', route: 'compat', paymentId: access.paymentId });
   if (!quota.ok) return quotaResponse(quota);
 
@@ -95,7 +101,7 @@ ${SUMMARY_MARKER}
   try {
     let claudeRes;
     try {
-      claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      claudeRes = await callAiProvider(aiMode, 'compat', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -113,7 +119,8 @@ ${SUMMARY_MARKER}
       await recordAiOutcome(env, quota.reservationId, 'unknown');
       throw e;
     }
-    await recordAiOutcome(env, quota.reservationId, claudeRes.ok ? 'ok' : 'provider_error');
+    await recordAiOutcome(env, quota.reservationId,
+      aiMode.mode === 'mock' ? 'mock' : (claudeRes.ok ? 'ok' : 'provider_error'));
 
     if (!claudeRes.ok) {
       return json({ error: 'ไม่สามารถเชื่อมต่อ AI ได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง' }, 502);
@@ -142,7 +149,7 @@ ${SUMMARY_MARKER}
     return json({ error: 'เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่' }, 502);
   }
 
-  return json({ reading, summary });
+  return json({ reading, summary, ...(aiMode.mode === 'mock' ? { mock: true } : {}) });
 }
 
 function json(data, status = 200) {

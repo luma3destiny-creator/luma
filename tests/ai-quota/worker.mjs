@@ -20,6 +20,7 @@ const [, , dbFile, route, bodyFile, ip] = process.argv;
 // ── the stub provider ───────────────────────────────────────────────────────
 let aiCalls = 0;
 let redisDeletes = 0;
+let emailsSent = 0;
 const MOCK = process.env.MOCK_AI || 'ok';
 const MOCK_TEXT = JSON.stringify({ career: 'ก', money: 'ข', health: 'ค', love: 'ง', spirit: 'จ',
   summary: { highlight: 'h', watch: 'w', action: 'a' } });
@@ -30,6 +31,11 @@ globalThis.fetch = async (url, init) => {
     if (MOCK === 'throw') throw new Error('simulated timeout / network error');
     if (MOCK === 'error') return new Response(JSON.stringify({ error: { message: 'overloaded' } }), { status: 529 });
     return new Response(JSON.stringify({ content: [{ type: 'text', text: MOCK_TEXT }] }), { status: 200 });
+  }
+  // email is stubbed too: counted, never sent
+  if (u.startsWith('https://api.resend.com/')) {
+    emailsSent++;
+    return new Response(JSON.stringify({ id: 'stub' }), { status: 200 });
   }
   // the legacy /api/reading entitlement store, stubbed so that route can be exercised
   if (u.startsWith('https://upstash.mock/')) {
@@ -47,7 +53,8 @@ if (process.env.FAIL_DB === 'all') {
 
 const env = { DB };
 for (const [k, v] of Object.entries(process.env)) {
-  if (k.startsWith('AI_QUOTA_') || k === 'ANTHROPIC_API_KEY' || k.startsWith('UPSTASH_')) env[k] = v;
+  if (k.startsWith('AI_QUOTA_') || k.startsWith('AI_MOCK_') || k === 'ANTHROPIC_API_KEY' ||
+      k === 'RESEND_API_KEY' || k.startsWith('UPSTASH_')) env[k] = v;
 }
 if (process.env.NO_API_KEY === '1') delete env.ANTHROPIC_API_KEY;
 if (process.env.NO_IP_SECRET === '1') delete env.AI_QUOTA_IP_SECRET;
@@ -56,6 +63,8 @@ console.log = () => {}; console.error = () => {}; console.warn = () => {};
 
 const headers = { 'content-type': 'application/json' };
 if (ip && ip !== '-') headers['cf-connecting-ip'] = ip;
+// what a caller SENDS asking for test mode — it can only ask, never decide
+if (process.env.SEND_MOCK_HEADER !== undefined) headers['x-luma-ai-mock-key'] = process.env.SEND_MOCK_HEADER;
 const raw = fs.readFileSync(bodyFile);
 let chunksPulled = 0;
 let request;
@@ -96,7 +105,7 @@ try {
   const res = await ROUTES[route]({ request, env });
   const text = await res.text();
   let body; try { body = JSON.parse(text); } catch { body = text; }
-  out = { status: res.status, body, retryAfter: res.headers.get('retry-after'), aiCalls, redisDeletes, chunksPulled, bodyBytes: raw.length };
+  out = { status: res.status, body, retryAfter: res.headers.get('retry-after'), aiCalls, redisDeletes, emailsSent, chunksPulled, bodyBytes: raw.length };
 } catch (e) {
   out = { status: 'threw', error: String(e && e.message || e), aiCalls };
 }

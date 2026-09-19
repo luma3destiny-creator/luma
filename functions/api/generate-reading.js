@@ -4,6 +4,7 @@
 // is counted against the free AI quota (per Cloudflare client IP, plus one
 // ceiling for all free callers). See functions/lib/ai-quota.mjs.
 import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
+import { resolveAiMode, callAiProvider } from '../lib/ai-provider.mjs';
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -80,13 +81,18 @@ export async function onRequestPost(context) {
 
   // Reserved only now: input is valid and the key exists, so this request will
   // really reach the provider. The slot is not given back if the call fails.
+  // Test mode is decided by the SERVER (see ai-provider.mjs). A request that
+  // asks for it without permission is refused here, before any quota.
+  const aiMode = resolveAiMode(env, request);
+  if (aiMode.mode === 'refuse') return aiMode.response;
+
   const quota = await reserveAiCall(env, { bucket: 'free', route: 'generate-reading', request });
   if (!quota.ok) return quotaResponse(quota);
 
   try {
     let res;
     try {
-      res = await fetch('https://api.anthropic.com/v1/messages', {
+      res = await callAiProvider(aiMode, 'generate-reading', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -104,7 +110,8 @@ export async function onRequestPost(context) {
       await recordAiOutcome(env, quota.reservationId, 'unknown');
       throw e;
     }
-    await recordAiOutcome(env, quota.reservationId, res.ok ? 'ok' : 'provider_error');
+    await recordAiOutcome(env, quota.reservationId,
+      aiMode.mode === 'mock' ? 'mock' : (res.ok ? 'ok' : 'provider_error'));
 
     const data = await res.json();
 
@@ -135,7 +142,7 @@ export async function onRequestPost(context) {
       reading.summary = null;
     }
 
-    return json({ ok: true, reading });
+    return json({ ok: true, reading, ...(aiMode.mode === 'mock' ? { mock: true } : {}) });
 
   } catch (e) {
     console.error('Generate reading failed:', e);
