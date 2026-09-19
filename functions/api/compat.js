@@ -1,4 +1,5 @@
 import { checkPaidAccess } from '../lib/paid-access.mjs';
+import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
 // functions/api/compat.js — Cloudflare Pages Function
 
 export async function onRequestOptions() {
@@ -14,18 +15,19 @@ export async function onRequestOptions() {
 export async function onRequestPost(context) {
   const { request, env } = context;
 
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ error: 'Invalid JSON' }, 400);
-  }
-
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ error: 'Invalid payload' }, 400);
+  const parsed = await readJsonBody(request, 16 * 1024);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   const { person1, person2, token } = body;
 
   if (!person1?.name || !person1?.birthDate || !person2?.name || !person2?.birthDate) {
     return json({ error: 'ข้อมูลไม่ครบ กรุณาระบุชื่อและวันเกิดของทั้งสองคน' }, 400);
+  }
+  for (const p of [person1, person2]) {
+    if (![[p.name, 100], [p.birthDate, 20], [p.birthTime, 10], [p.gender, 5], [p.animal, 20]]
+          .every(([v, max]) => boundedText(v, max).ok)) {
+      return json({ error: 'ข้อมูลไม่ถูกต้อง' }, 400);
+    }
   }
 
   const access = await checkPaidAccess(env, token);
@@ -83,9 +85,17 @@ ${SUMMARY_MARKER}
 จากนั้นในบรรทัดถัดไป เขียน JSON บรรทัดเดียว (ห้ามขึ้นบรรทัดใหม่ในค่า ห้ามมีข้อความอื่นปนอยู่) สรุปจากเนื้อหา 4 หัวข้อข้างต้นเท่านั้น ห้ามเพิ่มข้อมูลใหม่ ประโยคละไม่เกิน 20 คำ ตามรูปแบบนี้:
 {"highlight":"จุดเด่นที่สุดของความสัมพันธ์คู่นี้","watch":"เรื่องที่ทั้งคู่ควรพูดคุยหรือระวังมากที่สุด","action":"สิ่งที่ทำได้จริงหนึ่งอย่างที่ทั้งคู่ควรลองทำด้วยกัน"}`;
 
+  // Counted per PAYMENT, not per token: recovering access issues a new token,
+  // and that must not come with a fresh allowance. Reserved only now -- after
+  // input, entitlement and key have all passed -- and never given back.
+  const quota = await reserveAiCall(env, { bucket: 'paid', route: 'compat', paymentId: access.paymentId });
+  if (!quota.ok) return quotaResponse(quota);
+
   let reading, summary = null;
   try {
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+    let claudeRes;
+    try {
+      claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -99,6 +109,11 @@ ${SUMMARY_MARKER}
         messages: [{ role: 'user', content: prompt }]
       })
     });
+    } catch (e) {
+      await recordAiOutcome(env, quota.reservationId, 'unknown');
+      throw e;
+    }
+    await recordAiOutcome(env, quota.reservationId, claudeRes.ok ? 'ok' : 'provider_error');
 
     if (!claudeRes.ok) {
       return json({ error: 'ไม่สามารถเชื่อมต่อ AI ได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง' }, 502);

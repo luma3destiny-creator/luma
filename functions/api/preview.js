@@ -1,4 +1,8 @@
-// functions/api/preview.js — Cloudflare Pages Function
+// functions/api/preview.js — LEGACY route. The frontend no longer calls it,
+// but it is still deployed and reachable without any payment, so it counts
+// against the free AI quota like /api/generate-reading and cannot be used to
+// get around it. See functions/lib/ai-quota.mjs.
+import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -13,18 +17,22 @@ export async function onRequestOptions() {
 export async function onRequestPost(context) {
   const { request, env } = context;
 
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ error: 'Invalid JSON' }, 400);
-  }
+  const parsed = await readJsonBody(request, 8 * 1024);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
 
   const { name, birthDate, birthTime, province, gender, astroData } = body;
 
   if (!name || !birthDate || !birthTime || !province || !gender) {
     return json({ error: 'ข้อมูลไม่ครบ' }, 400);
   }
+  if (![[name, 100], [birthDate, 20], [birthTime, 10], [province, 100], [gender, 5]]
+        .every(([v, max]) => boundedText(v, max).ok)) {
+    return json({ error: 'ข้อมูลไม่ถูกต้อง' }, 400);
+  }
+  // This route never checked for the key: without one it would still have
+  // reached the provider. Refuse before anything is reserved.
+  if (!env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 503);
 
   const genderText = gender === 'm' ? 'ชาย' : 'หญิง';
 
@@ -55,8 +63,13 @@ export async function onRequestPost(context) {
 
 เขียนเฉพาะส่วน "บุคลิกภาพและพลังงานชีวิต" ของคนนี้ เป็นภาษาไทย 3-4 ประโยค อ่านง่าย ราวกับนักโหราศาสตร์นั่งคุยด้วยตรงๆ อ้างอิงข้อมูลดาวด้านบนให้ชัดเจน บอกตรงๆ ทั้งจุดแข็งและจุดที่ต้องระวัง ห้ามใช้เครื่องหมาย # หรือ * หรือ - เด็ดขาด ใช้ตัวอักษรธรรมดาเท่านั้น ไม่ต้องใส่หัวข้อ`;
 
+  const quota = await reserveAiCall(env, { bucket: 'free', route: 'preview', request });
+  if (!quota.ok) return quotaResponse(quota);
+
   try {
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+    let claudeRes;
+    try {
+      claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -70,6 +83,11 @@ export async function onRequestPost(context) {
         messages: [{ role: 'user', content: prompt }]
       })
     });
+    } catch (e) {
+      await recordAiOutcome(env, quota.reservationId, 'unknown');
+      throw e;
+    }
+    await recordAiOutcome(env, quota.reservationId, claudeRes.ok ? 'ok' : 'provider_error');
 
     if (!claudeRes.ok) {
       return json({ error: 'ไม่สามารถเชื่อมต่อ AI ได้' }, 502);

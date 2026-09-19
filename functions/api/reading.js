@@ -1,4 +1,9 @@
-// functions/api/reading.js — Cloudflare Pages Function
+// functions/api/reading.js — LEGACY route. The frontend no longer calls it,
+// but it is still deployed and reachable, so it counts against the free AI
+// quota (per Cloudflare client IP, plus the free ceiling) and cannot be used
+// to get around it. It has no payments-table entitlement to count per payment,
+// which is why it sits in the free budget. See functions/lib/ai-quota.mjs.
+import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -13,17 +18,18 @@ export async function onRequestOptions() {
 export async function onRequestPost(context) {
   const { request, env } = context;
 
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ error: 'Invalid JSON' }, 400);
-  }
+  const parsed = await readJsonBody(request, 8 * 1024);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
 
   const { name, email, birthDate, birthTime, province, gender, astroData, chargeId } = body;
 
   if (!name || !birthDate || !birthTime || !province || !gender) {
     return json({ error: 'ข้อมูลไม่ครบ กรุณาระบุชื่อ วันเกิด เวลาเกิด จังหวัด และเพศ' }, 400);
+  }
+  if (![[name, 100], [email, 254], [birthDate, 20], [birthTime, 10], [province, 100],
+        [gender, 5], [chargeId, 200]].every(([v, max]) => boundedText(v, max).ok)) {
+    return json({ error: 'ข้อมูลไม่ถูกต้อง' }, 400);
   }
 
   if (!chargeId) {
@@ -119,9 +125,17 @@ export async function onRequestPost(context) {
 
 ห้ามใช้เครื่องหมาย # หรือ * หรือ - เด็ดขาด ใช้ตัวอักษรธรรมดาเท่านั้น`;
 
+  // This route never checked for the key. Refuse before anything is reserved.
+  if (!env.ANTHROPIC_API_KEY) return json({ error: 'AI ยังไม่พร้อม' }, 503);
+
+  const quota = await reserveAiCall(env, { bucket: 'free', route: 'reading', request });
+  if (!quota.ok) return quotaResponse(quota);
+
   let reading;
   try {
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+    let claudeRes;
+    try {
+      claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -135,6 +149,11 @@ export async function onRequestPost(context) {
         messages: [{ role: 'user', content: prompt }]
       })
     });
+    } catch (e) {
+      await recordAiOutcome(env, quota.reservationId, 'unknown');
+      throw e;
+    }
+    await recordAiOutcome(env, quota.reservationId, claudeRes.ok ? 'ok' : 'provider_error');
 
     if (!claudeRes.ok) {
       return json({ error: 'ไม่สามารถเชื่อมต่อ AI ได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง' }, 502);

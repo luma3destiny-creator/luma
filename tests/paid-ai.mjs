@@ -1,11 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { openD1 } from './otp-concurrency/d1.mjs';
 import { onRequestPost as compat } from '../functions/api/compat.js';
 import { onRequestPost as vision } from '../functions/api/analyze-vision.js';
 test('both paid AI handlers require a paid token with a valid future expiry',async()=>{
  const {DB,raw}=openD1(':memory:');
  raw.exec("CREATE TABLE payments(id INTEGER PRIMARY KEY,token TEXT,status TEXT,expires_at TEXT)");
+ // Paid AI calls now also need the quota table; without it they refuse (tests/ai-quota covers that).
+ raw.exec(readFileSync(new URL('../migrations/008_ai_quota.sql', import.meta.url),'utf8'));
  const insert=raw.prepare('INSERT INTO payments(token,status,expires_at) VALUES(?,?,?)');
  for(const [token,status,expiry] of [['valid','paid','2099-01-01'],['expired','paid','2000-01-01'],['missing','paid',null],['bad-date','paid','invalid'],['pending','pending','2099-01-01']]) insert.run(token,status,expiry);
  const original=globalThis.fetch; let calls=0;

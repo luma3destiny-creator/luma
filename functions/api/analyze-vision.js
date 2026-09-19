@@ -1,4 +1,11 @@
 import { checkPaidAccess } from '../lib/paid-access.mjs';
+import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
+
+// The provider accepts images up to about 5 MB; base64 adds a third. A body
+// larger than this is not a photo anyone needs read, and forwarding it would
+// be the most expensive request this site can make.
+const MAX_VISION_BODY_BYTES = 7 * 1024 * 1024;
+const MAX_IMAGE_BASE64_CHARS = 7 * 1024 * 1024 - 4096;
 // functions/api/analyze-vision.js — Claude Vision for face & palm reading
 
 export async function onRequestOptions() {
@@ -14,14 +21,18 @@ export async function onRequestOptions() {
 export async function onRequestPost(context) {
   const { request, env } = context;
 
-  let body;
-  try { body = await request.json(); } catch {
-    return json({ error: 'Invalid JSON' }, 400);
-  }
-
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ error: 'Invalid payload' }, 400);
+  const parsed = await readJsonBody(request, MAX_VISION_BODY_BYTES);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   const { imageBase64, mediaType, mode, personName, token } = body;
   if (!imageBase64 || !mode) return json({ error: 'ข้อมูลไม่ครบ' }, 400);
+  if (typeof imageBase64 !== 'string' || imageBase64.length > MAX_IMAGE_BASE64_CHARS) {
+    return json({ error: 'รูปภาพมีขนาดใหญ่เกินไป' }, 413);
+  }
+  if (mode !== 'face' && mode !== 'palm') return json({ error: 'mode ไม่ถูกต้อง' }, 400);
+  if (!boundedText(personName, 100).ok || !boundedText(mediaType, 40).ok) {
+    return json({ error: 'ข้อมูลไม่ถูกต้อง' }, 400);
+  }
 
   // ── Server-side entitlement check ────────────────────────────────────────
   // Face/palm reading is part of the paid package. Until now this endpoint
@@ -102,8 +113,15 @@ ${guardrails}
   const prompt = prompts[mode];
   if (!prompt) return json({ error: 'mode ไม่ถูกต้อง' }, 400);
 
+  // Counted per PAYMENT, not per token, and shared with the couple reading:
+  // one paid allowance per purchase. Reserved only now and never given back.
+  const quota = await reserveAiCall(env, { bucket: 'paid', route: 'analyze-vision', paymentId: access.paymentId });
+  if (!quota.ok) return quotaResponse(quota);
+
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    let res;
+    try {
+      res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -123,6 +141,11 @@ ${guardrails}
         }]
       })
     });
+    } catch (e) {
+      await recordAiOutcome(env, quota.reservationId, 'unknown');
+      throw e;
+    }
+    await recordAiOutcome(env, quota.reservationId, res.ok ? 'ok' : 'provider_error');
 
     const data = await res.json();
     if (!res.ok) {

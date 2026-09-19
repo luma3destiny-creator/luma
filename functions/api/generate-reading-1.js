@@ -1,4 +1,8 @@
-// functions/api/generate-reading.js — Cloudflare Pages Function (Claude AI)
+// functions/api/generate-reading-1.js — LEGACY route. The frontend no longer
+// calls it, but it is still deployed and still reachable, so it counts against
+// the SAME free AI quota as /api/generate-reading. It must never be a way
+// around that limit. See functions/lib/ai-quota.mjs.
+import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -13,12 +17,18 @@ export async function onRequestOptions() {
 export async function onRequestPost(context) {
   const { request, env } = context;
 
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ error: 'Invalid JSON' }, 400);
+  const parsed = await readJsonBody(request, 8 * 1024);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+
+  // Every one of these is pasted into the prompt, so an oversized value is an
+  // oversized bill. Real values are a sign or element name -- a few words.
+  const SIGN_FIELDS = ['sunSign','moonSign','ascSign','mcSign','venusSign','house2Sign',
+                       'house6Sign','rahuSign','ketuSign','neptuneSign','dominant','wealthEl','healthEl'];
+  for (const f of SIGN_FIELDS) {
+    if (!boundedText(body[f], 40).ok) return json({ error: 'ข้อมูลไม่ถูกต้อง' }, 400);
   }
+  if (!boundedText(body.personName, 100).ok) return json({ error: 'ชื่อยาวเกินไป' }, 400);
 
   const {
     sunSign, moonSign, ascSign, mcSign, venusSign,
@@ -61,8 +71,13 @@ export async function onRequestPost(context) {
 - ตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่น:
 {"career":"...","money":"...","health":"...","love":"...","spirit":"..."}`;
 
+  const quota = await reserveAiCall(env, { bucket: 'free', route: 'generate-reading-1', request });
+  if (!quota.ok) return quotaResponse(quota);
+
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    let res;
+    try {
+      res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -76,6 +91,11 @@ export async function onRequestPost(context) {
         messages: [{ role: 'user', content: prompt }]
       })
     });
+    } catch (e) {
+      await recordAiOutcome(env, quota.reservationId, 'unknown');
+      throw e;
+    }
+    await recordAiOutcome(env, quota.reservationId, res.ok ? 'ok' : 'provider_error');
 
     const data = await res.json();
 
