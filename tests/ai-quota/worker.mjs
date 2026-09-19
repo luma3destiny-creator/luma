@@ -54,7 +54,7 @@ if (process.env.FAIL_DB === 'all') {
 const env = { DB };
 for (const [k, v] of Object.entries(process.env)) {
   if (k.startsWith('AI_QUOTA_') || k.startsWith('AI_MOCK_') || k === 'ANTHROPIC_API_KEY' ||
-      k === 'RESEND_API_KEY' || k.startsWith('UPSTASH_')) env[k] = v;
+      k === 'RESEND_API_KEY' || k === 'CF_PAGES_BRANCH' || k.startsWith('UPSTASH_')) env[k] = v;
 }
 if (process.env.NO_API_KEY === '1') delete env.ANTHROPIC_API_KEY;
 if (process.env.NO_IP_SECRET === '1') delete env.AI_QUOTA_IP_SECRET;

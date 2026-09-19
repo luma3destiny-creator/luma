@@ -31,11 +31,22 @@ const BASE_ENV = { ANTHROPIC_API_KEY: 'mock-key', AI_QUOTA_IP_SECRET: 'test-ip-s
 
 // Payments are FIXTURES in a throwaway temp database — never Preview or
 // Production. Nothing here is written to a real system.
-function freshDb({ quotaTable = true } = {}) {
+// previewSwitch: 'none' = a Production-like database (no switch table at all),
+// 'off' = the preview database with test mode off, 'on' = on for two hours,
+// 'expired' = it was on but the time has passed, 'wrongenv' = the row says
+// something other than 'preview'.
+function freshDb({ quotaTable = true, previewSwitch = 'none' } = {}) {
   for (const f of fs.readdirSync(TMP)) fs.rmSync(path.join(TMP, f), { force: true });
   const { raw } = openD1(DBFILE);
   raw.exec(fs.readFileSync(path.join(HERE, '..', 'otp-concurrency', 'schema.sql'), 'utf8'));
   if (quotaTable) raw.exec(fs.readFileSync(path.join(ROOT, 'migrations', '009_ai_quota.sql'), 'utf8'));
+  if (previewSwitch !== 'none') {
+    raw.exec(fs.readFileSync(path.join(ROOT, 'migrations', '010_preview_test_switch.sql'), 'utf8'));
+    const until = { on: "datetime('now','+2 hours')", off: 'NULL', expired: "datetime('now','-1 minute')",
+                    wrongenv: "datetime('now','+2 hours')" }[previewSwitch];
+    raw.exec(`UPDATE preview_test_switch SET ai_mock_until = ${until}` +
+             (previewSwitch === 'wrongenv' ? `, environment = 'production'` : '') + ` WHERE id = 1`);
+  }
   const ins = raw.prepare(
     `INSERT INTO payments (id, phone, name, charge_id, amount, status, token, paid_at, expires_at)
      VALUES (?, ?, ?, ?, 5900, ?, ?, datetime('now'), ?)`);
@@ -330,7 +341,7 @@ const isLabelled = (r) => JSON.stringify(r.body).includes('ข้อมูลท
 
 // ── 17. correctly enabled: canned answer, real D1 quota, no provider call ───
 {
-  freshDb();
+  freshDb({ previewSwitch: 'on' });
   const r = (await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.170']], MOCK_ON))[0];
   check('test mode: 200 with a canned answer', r.status === 200 && r.body.ok === true, JSON.stringify(r).slice(0, 160));
   check('…marked mock:true and labelled as test data in the text', r.body.mock === true && isLabelled(r));
@@ -342,7 +353,7 @@ const isLabelled = (r) => JSON.stringify(r.body).includes('ข้อมูลท
 
 // ── 18. the cap holds in test mode exactly as it does for real ─────────────
 {
-  freshDb();
+  freshDb({ previewSwitch: 'on' });
   const rs = await burst(Array.from({ length: 6 }, () => ['generate-reading', BODIES['generate-reading'](), '203.0.113.171']),
                          { ...MOCK_ON, AI_QUOTA_FREE_PER_IP: '2' });
   check('6 simultaneous test-mode calls, limit 2 → exactly 2 answered, 4 × 429',
@@ -361,7 +372,7 @@ const isLabelled = (r) => JSON.stringify(r.body).includes('ข้อมูลท
     ['empty header sent',                           { AI_MOCK_ENV: 'preview', AI_MOCK_SECRET: TEST_SECRET, SEND_MOCK_HEADER: '' }],
   ];
   for (const [name, env] of cases) {
-    freshDb();
+    freshDb({ previewSwitch: 'on' });
     const rs = await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.172'],
                             ['compat', BODIES.compat('tok-A')]], env);
     check(name + ': 403 on free and paid routes',
@@ -374,7 +385,7 @@ const isLabelled = (r) => JSON.stringify(r.body).includes('ข้อมูลท
 
 // ── 20. no header: the real path, untouched, even with test mode enabled ──
 {
-  freshDb();
+  freshDb({ previewSwitch: 'on' });
   const r = (await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.173']],
                          { AI_MOCK_ENV: 'preview', AI_MOCK_SECRET: TEST_SECRET }))[0];
   check('without the header, the normal provider path runs (test mode is never the default)',
@@ -384,7 +395,7 @@ const isLabelled = (r) => JSON.stringify(r.body).includes('ข้อมูลท
 
 // ── 21. paid routes: a bad token is refused before any quota ──────────────
 {
-  freshDb();
+  freshDb({ previewSwitch: 'on' });
   const rs = await burst([['compat', BODIES.compat('not-a-real-token')],
                           ['analyze-vision', BODIES['analyze-vision']('tok-C')]], MOCK_ON);   // tok-C is pending
   check('test mode with an unentitled token → 402 on both paid routes',
@@ -401,14 +412,54 @@ const isLabelled = (r) => JSON.stringify(r.body).includes('ข้อมูลท
 {
   const LEG = { UPSTASH_REDIS_REST_URL: 'https://upstash.mock', UPSTASH_REDIS_REST_TOKEN: 'x', RESEND_API_KEY: 'stub' };
   const withEmail = () => ({ ...BODIES.reading(), email: 'someone@example.com' });
-  freshDb();
+  freshDb({ previewSwitch: 'on' });
   const real = (await burst([['reading', withEmail(), '203.0.113.174']], LEG))[0];
   check('control: the legacy reading route does email on the real path', real.emailsSent === 1, 'emails=' + real.emailsSent);
-  freshDb();
+  freshDb({ previewSwitch: 'on' });
   const mock = (await burst([['reading', withEmail(), '203.0.113.175']], { ...LEG, ...MOCK_ON }))[0];
   check('in test mode it sends NO email', mock.status === 200 && mock.emailsSent === 0 && mock.body.emailSent === false,
         JSON.stringify(mock).slice(0, 160));
   check('…and its answer is labelled test data', mock.body.mock === true && isLabelled(mock));
+}
+
+
+// ── 23. Production with the test variables copied in by mistake ───────────
+// The case the database check exists for: AI_MOCK_ENV=preview, the right
+// secret, the right header -- but the deployment is bound to a database that is
+// not the preview one. Must be refused before any quota, with no AI call and no
+// canned answer.
+{
+  const cases = [
+    ['Production database (no switch table), every variable correct', { previewSwitch: 'none' }, {}],
+    ['preview database, but test mode switched off',                  { previewSwitch: 'off' }, {}],
+    ['preview database, but the switch has expired',                  { previewSwitch: 'expired' }, {}],
+    ['switch row names a different environment',                      { previewSwitch: 'wrongenv' }, {}],
+    ['switch on, but CF_PAGES_BRANCH says the production branch',     { previewSwitch: 'on' }, { CF_PAGES_BRANCH: 'main' }],
+  ];
+  for (const [name, dbOpts, extraEnv] of cases) {
+    freshDb(dbOpts);
+    const rs = await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.180'],
+                            ['compat', BODIES.compat('tok-A')],
+                            ['analyze-vision', BODIES['analyze-vision']('tok-A')]], { ...MOCK_ON, ...extraEnv });
+    check(name + ': 403 on every route', rs.every(r => r.status === 403), JSON.stringify(rs.map(r => r.status)));
+    check('…no AI call, no canned answer, no quota row',
+          sum(rs) === 0 && !rs.some(isLabelled) && rows().length === 0, 'ai=' + sum(rs) + ' rows=' + rows().length);
+  }
+
+  // A preview branch name is fine, and the database can be down: then it is NO.
+  freshDb({ previewSwitch: 'on' });
+  let r = (await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.181']], { ...MOCK_ON, CF_PAGES_BRANCH: 'round1-entitlement-webhook' }))[0];
+  check('a non-production branch name does not block test mode', r.status === 200 && r.body.mock === true, 'status=' + r.status);
+  r = (await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.182']], { ...MOCK_ON, FAIL_DB: 'all' }))[0];
+  check('database unreadable → test mode refused (403), no AI call', r.status === 403 && r.aiCalls === 0, JSON.stringify(r).slice(0, 120));
+
+  // Turning the switch off takes effect for the next request, whatever variables the deployment carries.
+  freshDb({ previewSwitch: 'on' });
+  const before = (await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.183']], MOCK_ON))[0];
+  q(`UPDATE preview_test_switch SET ai_mock_until = NULL WHERE id = 1`);
+  const after = (await burst([['generate-reading', BODIES['generate-reading'](), '203.0.113.184']], MOCK_ON))[0];
+  check('switching off in the database stops test mode immediately (200 → 403)',
+        before.status === 200 && after.status === 403 && after.aiCalls === 0, before.status + ' → ' + after.status);
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed   (real handlers, real SQLite file, parallel processes, stub AI provider — 0 real AI calls)\n');

@@ -66,7 +66,7 @@ export async function onRequestPost(context) {
 
   // Test mode is decided by the SERVER (see ai-provider.mjs). A request that
   // asks for it without permission is refused here, before any quota.
-  const aiMode = resolveAiMode(env, request);
+  const aiMode = await resolveAiMode(env, request);
   if (aiMode.mode === 'refuse') return aiMode.response;
 
   const quota = await reserveAiCall(env, { bucket: 'free', route: 'preview', request });

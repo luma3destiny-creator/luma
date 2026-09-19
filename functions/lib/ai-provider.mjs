@@ -13,20 +13,39 @@
 //
 // WHO DECIDES
 //
-// The SERVER decides, from two variables that exist only where the owner put
-// them. A request can only ASK; it can never switch the mode on. All three must
-// hold, or a request that asks is refused outright (403) -- before any quota
-// is reserved, without a real AI call, and without a canned answer:
+// The SERVER decides. A request can only ASK, by sending x-luma-ai-mock-key;
+// it can never switch the mode on. Every one of these must hold, or a request
+// that asks is refused outright (403) -- before any quota is reserved, without
+// a real AI call, and without a canned answer:
 //
-//   AI_MOCK_ENV     must equal 'preview'. Set it ONLY in the Preview
-//                   environment's variables. Nothing a caller sends can set it.
-//   AI_MOCK_SECRET  at least 32 characters, set ONLY in Preview, as a Secret.
-//                   Never in the frontend, never in Git.
-//   header x-luma-ai-mock-key  equal to AI_MOCK_SECRET (compared in constant
-//                   time). Only someone holding the secret can send it.
+//   1. The DATABASE this deployment is bound to says it is the preview
+//      database and that test mode is on right now: a row in
+//      preview_test_switch (migration 010, run ONLY on luma-db-preview) with
+//      environment = 'preview' and ai_mock_until in the future.
+//      This is the check that makes it Preview-only. Cloudflare binds
+//      luma-db-preview to Preview and luma-db to Production, and the D1
+//      binding is known to reach Pages Functions at runtime. Production's
+//      database has no such table, so a Production deployment fails here even
+//      if every variable below were copied into Production by mistake.
+//      It is also a switch that covers OLD deployments, which keep whatever
+//      variables they were created with: it expires on its own, and setting it
+//      back to NULL turns test mode off everywhere at once.
+//   2. AI_MOCK_ENV == 'preview'  -- set only in Preview's variables.
+//   3. AI_MOCK_SECRET, at least 32 characters -- a Secret, only in Preview.
+//      Never in the frontend, never in Git.
+//   4. header x-luma-ai-mock-key == AI_MOCK_SECRET, compared in constant time.
+//
+// Additionally, if CF_PAGES_BRANCH happens to be visible at runtime and names
+// the production branch, test mode is refused. That value is documented for
+// the build and is NOT relied on to ALLOW anything; it can only deny.
+//
+// What this still does not prove: that nobody binds luma-db-preview to
+// Production, or runs migration 010 against luma-db. Both are explicit
+// configuration acts, not something a request or a copied variable can do.
 //
 // A request that does not send the header is completely unaffected: it takes
-// the real path exactly as before. The mode is off unless all three line up.
+// the real path exactly as before. The mode is off unless all of the above
+// line up.
 //
 // WHAT A TEST ANSWER LOOKS LIKE
 //
@@ -46,27 +65,34 @@ function timingSafeEqual(a, b) {
   return diff === 0;
 }
 
+const PRODUCTION_BRANCH = 'main';
+
 /**
  * Decide, once per request and before any quota is reserved, how the provider
  * call will be made.
  *   { mode: 'real' }                 no test header: the normal path
- *   { mode: 'mock' }                 test header, and the server allows it
- *   { mode: 'refuse', response }     test header, but the server does not
+ *   { mode: 'mock' }                 test header, and every check passes
+ *   { mode: 'refuse', response }     test header, and any check fails
  */
-export function resolveAiMode(env, request) {
+export async function resolveAiMode(env, request) {
   const asked = request && request.headers && request.headers.get
     ? request.headers.get(AI_MOCK_HEADER) : null;
   if (asked === null || asked === undefined) return { mode: 'real' };
 
   const e = env || {};
-  const enabledHere = e.AI_MOCK_ENV === 'preview';
   const secret = typeof e.AI_MOCK_SECRET === 'string' ? e.AI_MOCK_SECRET : '';
-  const secretUsable = secret.length >= MIN_SECRET_LENGTH;
+  const variablesAllow =
+    e.AI_MOCK_ENV === 'preview' &&
+    secret.length >= MIN_SECRET_LENGTH &&
+    timingSafeEqual(asked, secret) &&
+    e.CF_PAGES_BRANCH !== PRODUCTION_BRANCH;       // deny-only; see header note
 
-  if (enabledHere && secretUsable && timingSafeEqual(asked, secret)) return { mode: 'mock' };
+  // Only consult the database once the cheap checks pass, and treat any
+  // failure to read it -- no binding, no table (Production), outage -- as NO.
+  if (variablesAllow && await boundDatabaseAllowsMock(e)) return { mode: 'mock' };
 
-  // Deliberately one answer for every reason -- wrong environment, no secret,
-  // wrong secret -- so the response does not tell a prober which it was.
+  // One answer for every reason, so the response does not tell a prober which
+  // check it failed.
   console.warn('ai-provider: test mode requested but not permitted here');
   return {
     mode: 'refuse',
@@ -75,6 +101,20 @@ export function resolveAiMode(env, request) {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     })
   };
+}
+
+async function boundDatabaseAllowsMock(env) {
+  if (!env.DB) return false;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT 1 AS ok FROM preview_test_switch
+        WHERE id = 1 AND environment = 'preview'
+          AND ai_mock_until IS NOT NULL AND ai_mock_until > datetime('now')`
+    ).first();
+    return !!(row && Number(row.ok) === 1);
+  } catch {
+    return false;   // no such table: this is not the preview database
+  }
 }
 
 /**
