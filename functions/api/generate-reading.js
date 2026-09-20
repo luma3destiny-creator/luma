@@ -9,6 +9,13 @@
 import { checkPaidAccess } from '../lib/paid-access.mjs';
 import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
 import { resolveAiMode, callAiProvider } from '../lib/ai-provider.mjs';
+import { parseReadingText } from '../lib/reading-json.mjs';
+
+// Shown when Claude answered but its answer cannot be used. Both are 502 (a
+// provider problem, not ours) and both invite the user to press again: nothing
+// here calls Claude a second time on its own.
+const MSG_TRUNCATED = 'ผลวิเคราะห์ยาวเกินกว่าระบบจะจัดรูปแบบได้ กรุณาลองใหม่อีกครั้ง';
+const MSG_UNPARSEABLE = 'ระบบจัดรูปแบบผลวิเคราะห์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง';
 
 export async function onRequestOptions() {
   return new Response(null, {
@@ -145,7 +152,14 @@ await recordAiOutcome(
     : (res.ok ? 'ok' : 'provider_error')
 );
 
-const data = await res.json();
+// A non-JSON body from the provider is a provider failure, not a crash.
+let data;
+try { data = await res.json(); } catch { data = null; }
+if ((!data || typeof data !== 'object') && !res.ok) data = {};   // reported as a provider error below
+if (!data || typeof data !== 'object') {
+  console.error('reading_parse_failed', JSON.stringify({ reason: 'provider_body_not_json', status: res.status }));
+  return json({ error: MSG_UNPARSEABLE, code: 'AI_OUTPUT_INVALID' }, 502);
+}
 
 console.log('reading_ai_metrics', JSON.stringify({
   mode: aiMode.mode,
@@ -158,31 +172,34 @@ console.log('reading_ai_metrics', JSON.stringify({
 }));
 
     if (!res.ok) {
-      console.error('Claude API error:', JSON.stringify(data));
+      // Only the provider's error type -- never the whole body.
+      console.error('Claude API error:', JSON.stringify({ status: res.status, type: (data.error && data.error.type) || null }));
       return json({ error: 'AI ไม่สามารถสร้างผลได้ กรุณาลองใหม่' }, 502);
     }
 
-    const textBlock = (data.content || []).find(function(b){ return b.type === 'text'; });
-    const rawText = (textBlock && textBlock.text ? textBlock.text : '').trim();
-    const jsonMatch = rawText.match(/\{[\s\S]*"spirit"[\s\S]*\}/);
-    if (!jsonMatch) {
-      console.error('No JSON in response:', rawText.slice(0, 300));
-      return json({ error: 'รูปแบบผลไม่ถูกต้อง' }, 500);
-    }
+    const textBlock = (Array.isArray(data.content) ? data.content : []).find(function(b){ return b && b.type === 'text'; });
+    const rawText = textBlock && typeof textBlock.text === 'string' ? textBlock.text : '';
 
-    let reading;
-    try {
-      reading = JSON.parse(jsonMatch[0]);
-    } catch (parseErr) {
-      console.error('JSON parse failed:', parseErr.message);
-      return json({ error: 'รูปแบบผลไม่ถูกต้อง' }, 500);
+    // Accepts bare JSON, a ```json fence, or a short sentence around the JSON,
+    // and checks all five topics are non-empty text. summary stays optional
+    // (null when missing or malformed), as before.
+    const parsed = parseReadingText(rawText);
+    if (!parsed.ok) {
+      // A complete, valid reading is used even if stop_reason is max_tokens;
+      // only an answer we cannot use is reported as cut off.
+      const truncated = data.stop_reason === 'max_tokens' || parsed.reason === 'truncated';
+      // Technical facts only: never the reading text, name, token or birth data.
+      console.error('reading_parse_failed', JSON.stringify({
+        reason: parsed.reason,
+        stop_reason: data.stop_reason ?? null,
+        text_length: rawText.length,
+        output_tokens: data.usage?.output_tokens ?? null
+      }));
+      return json(truncated
+        ? { error: MSG_TRUNCATED, code: 'AI_OUTPUT_TRUNCATED' }
+        : { error: MSG_UNPARSEABLE, code: 'AI_OUTPUT_INVALID' }, 502);
     }
-
-    // summary is a nice-to-have (used for the "สรุปของคุณ" email block) —
-    // never fail the whole reading if it's missing or malformed.
-    if (!reading.summary || typeof reading.summary !== 'object') {
-      reading.summary = null;
-    }
+    const reading = parsed.reading;
 
     return json({ ok: true, reading, ...(aiMode.mode === 'mock' ? { mock: true } : {}) });
 
