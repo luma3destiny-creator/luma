@@ -520,6 +520,69 @@ const isLabelled = (r) => JSON.stringify(r.body).includes('ข้อมูลท
   check('…before reserving anything', rows().length === 0 && sum(rs) === 0);
 }
 
+// ── 23. /api/generate-reading: a paid token moves the reading to paid quota ──
+{
+  const GR = (extra, ip) => ['generate-reading', { ...BODIES['generate-reading'](), ...extra }, ip];
+  const env = { AI_QUOTA_FREE_PER_IP: '1', AI_QUOTA_PAID_PER_PAYMENT: '2' };
+  const IP = '203.0.113.200';
+
+  // a) no token: free quota, exactly as before
+  freshDb();
+  let r = (await burst([GR({}, IP)], env))[0];
+  check('generate-reading without a token → 200 on the free quota',
+        r.status === 200 && r.aiCalls === 1 && rows().length === 1 && rows()[0].bucket === 'free' && rows()[0].subject.startsWith('ip:'),
+        JSON.stringify(rows()));
+  r = (await burst([GR({}, IP)], env))[0];
+  check('…the next token-less call from that IP hits the free limit (429, no AI)', r.status === 429 && r.aiCalls === 0, 'status=' + r.status);
+
+  // b) free quota used up, valid paid token → paid quota
+  r = (await burst([GR({ token: 'tok-A' }, IP)], env))[0];
+  check('free limit used up + valid paid token → 200 through the paid quota', r.status === 200 && r.aiCalls === 1, JSON.stringify(r.body));
+  const paidRows = rows().filter(x => x.bucket === 'paid');
+  check('…recorded as bucket=paid, subject=pay:1, route=generate-reading',
+        paidRows.length === 1 && paidRows[0].subject === 'pay:1' && paidRows[0].route === 'generate-reading', JSON.stringify(paidRows));
+  check('…and no free slot was used', rows().filter(x => x.bucket === 'free').length === 1);
+  check('…the token itself is stored nowhere in the quota table', !JSON.stringify(rows()).includes('tok-A'));
+
+  // c) sent but not valid → refused before AI and before any quota, even
+  //    though the free quota would still allow this IP (so no fallback)
+  freshDb();
+  q(`INSERT INTO payments (id, phone, name, charge_id, amount, status, token, paid_at, expires_at)
+     VALUES (4, '0800000004', 'ลูกค้าสี่', 'pi_d', 5900, 'paid', 'tok-D-expired', datetime('now','-40 days'), datetime('now','-1 day'))`);
+  const bad = await burst([
+    GR({ token: 'not-a-real-token' }, '203.0.113.201'),
+    GR({ token: 'tok-D-expired' },    '203.0.113.202'),
+    GR({ token: 'tok-C' },            '203.0.113.203'),   // pending, never paid
+    GR({ token: '' },                 '203.0.113.204'),
+    GR({ token: 'dev' },              '203.0.113.205'),
+    GR({ token: 12345 },              '203.0.113.206'),
+    GR({ token: null },               '203.0.113.207'),
+    GR({ token: ['tok-A'] },          '203.0.113.208')
+  ], env);
+  check('fake / expired / pending / empty / dev token → 402',
+        bad.slice(0, 5).every(x => x.status === 402), JSON.stringify(bad.map(x => x.status)));
+  check('non-string token (number, null, array) → 400',
+        bad.slice(5).every(x => x.status === 400), JSON.stringify(bad.map(x => x.status)));
+  check('…none of them reached the AI or reserved any quota (no fallback to free)',
+        sum(bad) === 0 && rows().length === 0, 'ai=' + sum(bad) + ' rows=' + rows().length);
+  check('…expired token gets the checkPaidAccess message',
+        bad[1].body && typeof bad[1].body.error === 'string' && bad[1].body.error.includes('หมดอายุ'), JSON.stringify(bad[1].body));
+
+  // d) the paid allowance belongs to the payment, not to the token
+  freshDb();
+  const two = await burst([GR({ token: 'tok-A' }, '203.0.113.210'), GR({ token: 'tok-A' }, '203.0.113.211')], env);
+  check('two paid readings on payment 1 (limit 2) succeed', two.every(x => x.status === 200), JSON.stringify(two.map(x => x.status)));
+  q(`UPDATE payments SET token = 'tok-A-recovered' WHERE id = 1`);   // what OTP recovery does
+  r = (await burst([GR({ token: 'tok-A-recovered' }, '203.0.113.212')], env))[0];
+  check('…a new token for the same payment is still at the limit (429, no AI)', r.status === 429 && r.aiCalls === 0, 'status=' + r.status);
+  r = (await burst([GR({ token: 'tok-A' }, '203.0.113.213')], env))[0];
+  check('…the replaced old token no longer works (402)', r.status === 402 && r.aiCalls === 0, 'status=' + r.status);
+  r = (await burst([GR({ token: 'tok-B' }, '203.0.113.214')], env))[0];
+  check('…a different payment is unaffected (200)', r.status === 200, 'status=' + r.status);
+  check('…every paid row is keyed by payment id',
+        rows().filter(x => x.bucket === 'paid').every(x => /^pay:\d+$/.test(x.subject)), JSON.stringify(rows().map(x => x.subject)));
+}
+
 console.log('\n' + pass + ' passed, ' + fail + ' failed   (real handlers, real SQLite file, parallel processes, stub AI provider — 0 real AI calls)\n');
 fs.rmSync(TMP, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

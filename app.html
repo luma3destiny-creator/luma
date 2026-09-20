@@ -1207,9 +1207,19 @@ if("1"===new URLSearchParams(location.search).get("dev")){
     }
     var timer = setTimeout(function () { controller.abort(); }, 45000);
     try {
+      // A paying customer's token goes in the request body only: it is not part
+      // of the cache key, not stored in the cache, not shown and not logged.
+      var requestBody = payload;
+      var paidToken = '';
+      try { paidToken = localStorage.getItem('luma_token') || ''; } catch (_) {}
+      if (paidToken) {
+        requestBody = {};
+        Object.keys(payload).forEach(function (name) { requestBody[name] = payload[name]; });
+        requestBody.token = paidToken;
+      }
       var response = await fetch('/api/generate-reading', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload), signal: controller.signal
+        body: JSON.stringify(requestBody), signal: controller.signal
       });
       var data;
       try { data = await response.json(); }

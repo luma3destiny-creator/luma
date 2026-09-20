@@ -1,8 +1,12 @@
 // functions/api/generate-reading.js — Cloudflare Pages Function (Claude AI)
 //
-// The free 5-area reading. No token or payment is required -- but every call
-// is counted against the free AI quota (per Cloudflare client IP, plus one
-// ceiling for all free callers). See functions/lib/ai-quota.mjs.
+// The 5-area reading. No token or payment is required. Without a token every
+// call is counted against the free AI quota (per Cloudflare client IP, plus one
+// ceiling for all free callers). With a valid, unexpired paid token it is
+// counted against that payment's paid quota instead; a token that is sent but
+// not valid is refused -- never quietly downgraded to the free quota.
+// See functions/lib/ai-quota.mjs.
+import { checkPaidAccess } from '../lib/paid-access.mjs';
 import { reserveAiCall, recordAiOutcome, quotaResponse, readJsonBody, boundedText } from '../lib/ai-quota.mjs';
 import { resolveAiMode, callAiProvider } from '../lib/ai-provider.mjs';
 
@@ -31,6 +35,18 @@ export async function onRequestPost(context) {
     if (!boundedText(body[f], 40).ok) return json({ error: 'ข้อมูลไม่ถูกต้อง' }, 400);
   }
   if (!boundedText(body.personName, 100).ok) return json({ error: 'ชื่อยาวเกินไป' }, 400);
+
+  // Paid or free is decided here, before test mode, the key check or any quota.
+  // No token at all -> free, exactly as before. A token that is sent must be a
+  // string and must pass checkPaidAccess; otherwise the request stops here: no
+  // AI call, no quota reserved, and no fallback to the free quota.
+  let paidAccess = null;
+  if (body.token !== undefined) {
+    if (typeof body.token !== 'string') return json({ error: 'ข้อมูลไม่ถูกต้อง' }, 400);
+    const access = await checkPaidAccess(env, body.token);
+    if (!access.ok) return json({ error: access.error }, access.status);
+    paidAccess = access;
+  }
 
   const {
     sunSign, moonSign, ascSign, mcSign, venusSign,
@@ -88,7 +104,11 @@ export async function onRequestPost(context) {
     return json({ error: 'ระบบวิเคราะห์ AI ยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแล', code: 'AI_NOT_CONFIGURED' }, 503);
   }
 
-  const quota = await reserveAiCall(env, { bucket: 'free', route: 'generate-reading', request });
+  // Paid readings are counted by payment id (not by token), so replacing the
+  // token through OTP recovery cannot reset the allowance.
+  const quota = paidAccess
+    ? await reserveAiCall(env, { bucket: 'paid', route: 'generate-reading', paymentId: paidAccess.paymentId })
+    : await reserveAiCall(env, { bucket: 'free', route: 'generate-reading', request });
   if (!quota.ok) return quotaResponse(quota);
 
   try {
