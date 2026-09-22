@@ -746,7 +746,15 @@ function renderVisionResult(r,mode,el){
   dlRow._highlight=(arr(r.personality)[0]||'').replace(/\s+/g,' ').trim();
   dlRow._cards=groups.filter(function(g){return r[g.key];}).map(function(g){return{icon:g.icon,label:g.label,text:(r[g.key]||'').replace(/\s+/g,' ').trim()};});
   setTimeout(function(){
-    html2canvas(card,{backgroundColor:'#0d0b1a',scale:2,useCORS:true,allowTaint:true,logging:false,ignoreElements:function(e){return e===dlRow;}}).then(function(canvas){
+    html2canvas(card,{backgroundColor:'#0d0b1a',scale:2,useCORS:true,allowTaint:true,logging:false,ignoreElements:function(e){return e===dlRow;},onclone:function(doc){
+      // The downloaded image is a static keepsake, so include the complete
+      // explanation and remove controls that cannot be clicked in a PNG.
+      var clonedCard=doc.querySelector('.vi-card');
+      if(!clonedCard)return;
+      clonedCard.querySelectorAll('details').forEach(function(d){d.open=true;});
+      clonedCard.querySelectorAll('.vi-readmore summary,.vi-extra summary,.vi-teaser,.vi-crosstab').forEach(function(node){node.style.display='none';});
+      clonedCard.querySelectorAll('.vi-readmore .vi-text').forEach(function(node){node.style.display='block';});
+    }}).then(function(canvas){
       // Keep the browser-native Blob for download. Rebuilding a large PNG by
       // hand from base64 can produce a zero-byte file on some browsers.
       canvas.toBlob(function(blob){
