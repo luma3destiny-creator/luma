@@ -1108,6 +1108,39 @@ window.simulateUnlock=function(){
 if("1"===new URLSearchParams(location.search).get("dev")){
   setTimeout(unlockVisionTabs, 500);
 }
+// Preview-only visual fixture: lets us inspect the vision result/download
+// layout while OTP and the paid entitlement flow are still being completed.
+// It never calls an API, writes storage, or runs on the production hostname.
+if("1"===new URLSearchParams(location.search).get("dev")&&
+   "1"===new URLSearchParams(location.search).get("vision-demo")&&
+   location.hostname!=="luma-9qx.pages.dev"){
+  setTimeout(function(){
+    var results=document.getElementById("results");
+    var face=document.getElementById("faceResult");
+    var palm=document.getElementById("palmResult");
+    if(!results||!face||!palm||typeof renderVisionResult!=="function")return;
+    unlockVisionTabs();
+    results.style.display="block";
+    var sample={
+      overall:"ตัวอย่างสำหรับตรวจการจัดวางข้อความยาวในรูปดาวน์โหลดเท่านั้น ไม่ใช่ผลวิเคราะห์จริง",
+      key_points:["ข้อความตัวอย่างที่ยาวพอสำหรับตรวจการตัดบรรทัด","การ์ดแต่ละใบต้องอยู่ในคอลัมน์ของตัวเอง","ไม่มีการเรียก AI หรือบันทึกข้อมูลใด ๆ"],
+      forehead:"หน้าผากกว้างและสมดุล สื่อถึงการวางแผนที่เป็นระบบและการเรียนรู้จากประสบการณ์ ข้อความนี้ตั้งใจให้ยาวเพื่อทดสอบว่าตัวอักษรจะไม่ไหลข้ามกล่องหรือทับกับคอลัมน์ข้างเคียง",
+      eyes:"แววตาสื่อถึงความตั้งใจและการสังเกตสิ่งรอบตัวได้ดี ควรเว้นจังหวะพักสายตาและสื่อสารความรู้สึกให้ชัดเจนเมื่อทำงานร่วมกับผู้อื่น",
+      nose:"รูปทรงโดยรวมใช้เป็นแนวทางความเชื่อดั้งเดิมเท่านั้น ไม่ใช่ข้อสรุปทางวิทยาศาสตร์ และข้อความยาวควรตัดขึ้นบรรทัดใหม่อย่างเรียบร้อย",
+      mouth:"การสื่อสารที่อบอุ่นช่วยให้ความสัมพันธ์ราบรื่น ควรฟังให้จบก่อนตอบและเลือกคำที่ตรงกับเจตนาของคุณ",
+      lifeline:"เส้นชีวิตเป็นสัญลักษณ์ตามศาสตร์ลายมือเพื่อการไตร่ตรองส่วนตัว ข้อความนี้ใช้ตรวจการจัดวางในภาพดาวน์โหลดและไม่ใช่คำแนะนำด้านสุขภาพ",
+      headline:"เส้นสมองสะท้อนแนวคิดและการตัดสินใจตามความเชื่อดั้งเดิม ควรใช้ข้อมูลจริงประกอบการตัดสินใจทุกครั้ง",
+      heartline:"เส้นจิตใจใช้เป็นแนวทางสะท้อนอารมณ์และความสัมพันธ์ คุยกันอย่างเปิดใจและเคารพขอบเขตของกันและกัน",
+      fateline:"เส้นวาสนาใช้ประกอบการทบทวนเป้าหมายชีวิต ไม่ได้กำหนดอนาคต และไม่ควรใช้แทนคำปรึกษาทางการเงินหรืออาชีพ",
+      improve:["แบ่งเป้าหมายใหญ่เป็นขั้นตอนเล็ก ๆ","พักและตรวจทานข้อมูลก่อนตัดสินใจ"],
+      life_advice:["ใช้ผลนี้เป็นแนวทางทบทวนตัวเองเท่านั้น","เลือกสิ่งที่เหมาะกับชีวิตจริงของคุณ"]
+    };
+    renderVisionResult(sample,"face",face);
+    renderVisionResult(sample,"palm",palm);
+    var first=document.querySelector('.tab-btn[data-tab="face"]');
+    if(first)first.click();
+  },700);
+}
 </script>
 <script>
 // Authenticated email submission for both reports, including returning users.
