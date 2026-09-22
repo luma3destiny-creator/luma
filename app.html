@@ -744,8 +744,13 @@ function renderVisionResult(r,mode,el){
   dlRow._cards=groups.filter(function(g){return r[g.key];}).map(function(g){return{icon:g.icon,label:g.label,text:(r[g.key]||'').replace(/\s+/g,' ').trim()};});
   setTimeout(function(){
     html2canvas(card,{backgroundColor:'#0d0b1a',scale:2,useCORS:true,allowTaint:true,logging:false,ignoreElements:function(e){return e===dlRow;}}).then(function(canvas){
-      dlRow._dataUrl=canvas.toDataURL('image/png');
-      dlRow.style.display='block';
+      // Keep the browser-native Blob for download. Rebuilding a large PNG by
+      // hand from base64 can produce a zero-byte file on some browsers.
+      canvas.toBlob(function(blob){
+        if(blob)dlRow._blob=blob;
+        dlRow._dataUrl=canvas.toDataURL('image/png');
+        dlRow.style.display='block';
+      },'image/png');
     }).catch(function(){/* silent */});
   },400);
 }
@@ -753,21 +758,19 @@ function renderVisionResult(r,mode,el){
 function dlVisionImg(btn){
   var dlRow=btn.closest('.vi-dl-row');
   var name=(document.getElementById('fnameInput')&&document.getElementById('fnameInput').value)||'luma';
-  if(dlRow&&dlRow._dataUrl){
-    var dataUrl=dlRow._dataUrl;
-    var byteStr=atob(dataUrl.split(',')[1]);
-    var mime=dataUrl.split(',')[0].split(':')[1].split(';')[0];
-    var ab=new ArrayBuffer(byteStr.length);
-    var ia=new Uint8Array(ab);
-    for(var i=0;i<byteStr.length;i++) ia[i]=byteStr.charCodeAt(i);
-    var blob=new Blob([ab],{type:mime});
-    var url=URL.createObjectURL(blob);
-    var a=document.createElement('a');
-    a.download='luma-vision-'+name+'.png';
-    a.href=url;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(function(){URL.revokeObjectURL(url);document.body.removeChild(a);},1000);
+  if(dlRow&& (dlRow._blob||dlRow._dataUrl)){
+    var saveBlob=function(blob){
+      if(!blob||!blob.size)return;
+      var url=URL.createObjectURL(blob);
+      var a=document.createElement('a');
+      a.download='luma-vision-'+name+'.png';
+      a.href=url;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function(){URL.revokeObjectURL(url);document.body.removeChild(a);},5000);
+    };
+    if(dlRow._blob)saveBlob(dlRow._blob);
+    else fetch(dlRow._dataUrl).then(function(res){return res.blob();}).then(saveBlob).catch(function(){});
   }
 }
 
