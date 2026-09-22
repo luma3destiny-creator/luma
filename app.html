@@ -81,7 +81,10 @@
 .vi-keypoints li::before{content:'✦';color:var(--gold-bright,#E5C66B);margin-right:6px;font-size:12px}
 .vi-teaser{font-size:14px;line-height:1.65;color:var(--ink,#f0ecff);margin:0 0 6px;opacity:.92}
 .vi-readmore{margin-top:2px}
-.vi-readmore summary{cursor:pointer;font-size:12.5px;color:var(--gold-bright,#E5C66B);list-style:none;display:inline-flex;align-items:center;gap:4px;font-weight:600;-webkit-user-select:none;user-select:none}
+.vi-readmore summary{cursor:pointer;font-size:12.5px;color:var(--gold-bright,#E5C66B);list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px;font-weight:700;-webkit-user-select:none;user-select:none;margin-top:10px;padding:9px 12px;border:1px solid rgba(212,175,79,.28);border-radius:9px;background:rgba(212,175,79,.06);transition:background .18s,border-color .18s,color .18s}
+.vi-readmore summary:hover{background:rgba(212,175,79,.13);border-color:rgba(212,175,79,.55);color:#fff}
+.vi-readmore summary::after{content:'⌄';font-size:15px;line-height:1;transition:transform .18s}
+.vi-readmore[open] summary::after{transform:rotate(180deg)}
 .vi-readmore summary::-webkit-details-marker{display:none}
 .vi-readmore summary:focus-visible{outline:2px solid var(--gold-bright,#E5C66B);outline-offset:2px;border-radius:4px}
 .vi-readmore:not([open]) .vi-rm-close-label{display:none}
@@ -638,7 +641,7 @@ function renderVisionResult(r,mode,el){
     sectionsHtml+='</div>';
     if(isLong){
       sectionsHtml+='<p class="vi-teaser">'+viEsc(t.slice(0,80))+'…</p>';
-      sectionsHtml+='<details class="vi-readmore"><summary><span class="vi-rm-open-label">อ่านเพิ่มเติม ▾</span><span class="vi-rm-close-label">ย่อ ▴</span></summary>';
+      sectionsHtml+='<details class="vi-readmore"><summary><span class="vi-rm-open-label">อ่านรายละเอียดเพิ่มเติม</span><span class="vi-rm-close-label">ย่อรายละเอียด</span></summary>';
       sectionsHtml+='<p class="vi-text">'+viEsc(t)+'</p>';
       sectionsHtml+='</details>';
     } else {
