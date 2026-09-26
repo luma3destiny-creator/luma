@@ -103,34 +103,44 @@ export async function sendSms(env, { to, text, code = null, tag = 'luma-otp' }) 
     // codes, so Luma stays the only system that does — exactly one OTP
     // implementation, per the round-1 design.
     //
-    // NOT YET VERIFIED against a live account. THSMS's public API page
-    // documents Check Credit / Send SMS / Send SMS Schedule Task and does not
-    // document the sender field or delivery reports; what a message actually
-    // shows as at the handset is unknown until a real send is observed. That is
-    // an open question, not a proven limitation.
+    // Contract: https://www.thsms.com/sms-api (V2 Send SMS).
+    // Provider acceptance is not proof of handset delivery. Live delivery
+    // must still be verified before enabling Production OTP recovery.
     if (!env.THSMS_API_KEY) return { ok: false, status: 'failed', reason: 'no_api_key', provider: 'thsms' };
-    const recipient = to.replace(/^\+/, '');
+    if (!env.SMS_SENDER_ID) return { ok: false, status: 'failed', reason: 'no_sender_id', provider: 'thsms' };
+    // LUMA passes +66; the documented V2 request uses local Thai numbers.
+    const recipient = String(to || '').replace(/^\+?66/, '0');
+    if (!/^0\d{9}$/.test(recipient)) return { ok: false, status: 'failed', reason: 'invalid_recipient', provider: 'thsms' };
     try {
-      const res = await fetch('https://thsms.com/api/rest', {
+      const res = await fetch('https://thsms.com/api/send-sms', {
         method: 'POST',
+        redirect: 'error',
+        signal: AbortSignal.timeout(10000),
         headers: {
           'Authorization': `Bearer ${env.THSMS_API_KEY}`,
           'Content-Type': 'application/json',
           'Accept': 'application/json'
         },
         body: JSON.stringify({
-          method: 'send',
-          msisdn: recipient,
+          msisdn: [recipient],
           message: text,
-          ...(env.SMS_SENDER_ID ? { sender: env.SMS_SENDER_ID } : {})
+          sender: env.SMS_SENDER_ID
         })
       });
       const data = await res.json().catch(() => null);
-      if (!res.ok) {
-        console.error('sms: thsms rejected the send:', data && (data.code || data.status));
+      // A server error or unreadable reply can follow a successful send.
+      // Keep that uncertainty; never retry automatically or log the reply.
+      if (res.status >= 500 || res.status === 408) {
+        return { ok: false, status: 'unknown', reason: 'provider_unavailable', provider: 'thsms' };
+      }
+      if (!res.ok || data?.success === false) {
         return { ok: false, status: 'failed', reason: 'provider_error', provider: 'thsms' };
       }
-      return { ok: true, status: 'sent', id: String((data && (data.message_id || data.id)) || ''), provider: 'thsms' };
+      if (data?.success !== true || data?.code !== 200) {
+        return { ok: false, status: 'unknown', reason: 'invalid_response', provider: 'thsms' };
+      }
+      // V2 does not promise a message ID in its documented success response.
+      return { ok: true, status: 'sent', provider: 'thsms' };
     } catch (e) {
       console.error('sms: thsms request failed');
       return { ok: false, status: 'unknown', reason: 'network_error', provider: 'thsms' };
