@@ -22,7 +22,7 @@ test('THSMS V2 adapter: all network calls are stubbed', async t => {
     assert.equal(options.method, 'POST');
     assert.equal(options.headers.Authorization, 'Bearer test-key-not-real');
     assert.deepEqual(JSON.parse(options.body), { msisdn: ['0900000000'], message: message.text, sender: 'SMSOTP' });
-    assert.equal(options.redirect, 'error');
+    assert.equal(options.redirect, 'manual');
     assert.ok(options.signal instanceof AbortSignal);
   });
 
@@ -51,6 +51,39 @@ test('THSMS V2 adapter: all network calls are stubbed', async t => {
     const before = calls.length;
     assert.equal((await sendSms(env, message)).status, 'unknown');
     assert.equal(calls.length - before, 1);
+  });
+
+  await t.test('redirects never forward credentials or retry', async () => {
+    for (const status of [301, 302, 303, 307, 308]) {
+      response = new Response(null, { status, headers: { Location: 'https://example.invalid/collect' } });
+      const before = calls.length;
+      const result = await sendSms(env, message);
+      assert.equal(result.reason, 'unexpected_redirect');
+      assert.equal(result.status, 'unknown');
+      assert.equal(calls.length - before, 1);
+      assert.equal(calls.at(-1).options.redirect, 'manual');
+    }
+  });
+
+  await t.test('diagnostics never expose exception text or secrets', async () => {
+    const logs = [];
+    const logger = t.mock.method(console, 'error', (...args) => logs.push(args.join(' ')));
+    try {
+      for (const [name, expected] of [
+        ['TimeoutError', 'request_timeout'], ['AbortError', 'request_aborted'],
+        ['TypeError', 'request_type_error'], ['Error', 'network_error']
+      ]) {
+        response = new Error(env.THSMS_API_KEY + message.to + message.text);
+        response.name = name;
+        const result = await sendSms(env, message);
+        assert.equal(result.reason, expected);
+        assert.equal(result.status, 'unknown');
+        const output = JSON.stringify({ result, logs });
+        for (const secret of [env.THSMS_API_KEY, message.to, message.text]) {
+          assert.equal(output.includes(secret), false);
+        }
+      }
+    } finally { logger.mock.restore(); }
   });
 
   await t.test('missing configuration and malformed recipient send nothing', async () => {

@@ -114,7 +114,9 @@ export async function sendSms(env, { to, text, code = null, tag = 'luma-otp' }) 
     try {
       const res = await fetch('https://thsms.com/api/send-sms', {
         method: 'POST',
-        redirect: 'error',
+        // workerd rejects redirect:'error' before making any request.
+        // Manual mode keeps credentials from being forwarded to another URL.
+        redirect: 'manual',
         signal: AbortSignal.timeout(10000),
         headers: {
           'Authorization': `Bearer ${env.THSMS_API_KEY}`,
@@ -127,6 +129,9 @@ export async function sendSms(env, { to, text, code = null, tag = 'luma-otp' }) 
           sender: env.SMS_SENDER_ID
         })
       });
+      if (res.status >= 300 && res.status < 400) {
+        return { ok: false, status: 'unknown', reason: 'unexpected_redirect', provider: 'thsms' };
+      }
       const data = await res.json().catch(() => null);
       // A server error or unreadable reply can follow a successful send.
       // Keep that uncertainty; never retry automatically or log the reply.
@@ -142,8 +147,14 @@ export async function sendSms(env, { to, text, code = null, tag = 'luma-otp' }) 
       // V2 does not promise a message ID in its documented success response.
       return { ok: true, status: 'sent', provider: 'thsms' };
     } catch (e) {
-      console.error('sms: thsms request failed');
-      return { ok: false, status: 'unknown', reason: 'network_error', provider: 'thsms' };
+      // Only fixed diagnostic labels: never log exception messages, which
+      // can contain headers, the recipient or message text.
+      const reason = e?.name === 'TimeoutError' ? 'request_timeout'
+        : e?.name === 'AbortError' ? 'request_aborted'
+        : e?.name === 'TypeError' ? 'request_type_error'
+        : 'network_error';
+      console.error('sms: thsms request failed (' + reason + ')');
+      return { ok: false, status: 'unknown', reason, provider: 'thsms' };
     }
   }
 
