@@ -73,7 +73,7 @@
         </div>
       </div>
       <div class="field-row">
-        <div><label for="pPlace">สถานที่เกิด</label><input id="pPlace" class="text-field" placeholder="เช่น กรุงเทพมหานคร" required maxlength="200"></div>
+        <div><label for="pPlace">สถานที่เกิด</label><select id="pPlace" required></select><p class="note" id="pPlaceMismatchNote" hidden></p></div>
         <div><label for="pGender">เพศกำเนิด</label>
           <select id="pGender" required><option value="m">ชาย</option><option value="f">หญิง</option></select>
         </div>
@@ -121,6 +121,89 @@ function fillOptions(select, count, start, textFn, step = 1) {
     select.appendChild(opt);
   }
 }
+
+// Same place list app.html's own #bplace picker uses (77 Thai provinces + international
+// cities, with lat/lng/timezone) -- kept byte-identical to app.html's `A`/`q` arrays and
+// to functions/lib/birth-places.mjs's canonical name list, so a place saved here always
+// resolves to a real coordinate on /app. There is no shared module across the static
+// pages and the Worker, so all three copies are kept in sync by hand.
+var PLACE_TH = [["กรุงเทพมหานคร",13.7563,100.5018],["สมุทรปราการ",13.5991,100.5998],["นนทบุรี",13.8622,100.5136],["ปทุมธานี",14.0208,100.525],["พระนครศรีอยุธยา",14.3532,100.5689],["อ่างทอง",14.5896,100.4549],["ลพบุรี",14.7995,100.6534],["สิงห์บุรี",14.8907,100.3968],["ชัยนาท",15.1851,100.1251],["สระบุรี",14.5289,100.9101],["นครนายก",14.2069,101.213],["นครปฐม",13.8199,100.062],["สมุทรสาคร",13.5475,100.274],["สมุทรสงคราม",13.4098,100.0022],["กาญจนบุรี",14.0227,99.5328],["สุพรรณบุรี",14.4744,100.1177],["ราชบุรี",13.5282,99.8134],["เพชรบุรี",13.1119,99.9398],["ประจวบคีรีขันธ์",11.8126,99.7957],["ฉะเชิงเทรา",13.6904,101.0779],["ชลบุรี",13.3611,100.9847],["ระยอง",12.6814,101.2816],["จันทบุรี",12.6103,102.1039],["ตราด",12.2428,102.5178],["ปราจีนบุรี",14.0509,101.3724],["สระแก้ว",13.824,102.0645],["นครราชสีมา",14.9799,102.0977],["บุรีรัมย์",14.9944,103.1029],["สุรินทร์",14.8818,103.4936],["ศรีสะเกษ",15.1186,104.322],["อุบลราชธานี",15.2287,104.856],["ยโสธร",15.7927,104.1451],["ชัยภูมิ",15.8068,102.0316],["อำนาจเจริญ",15.8656,104.6266],["หนองบัวลำภู",17.2044,102.4261],["ขอนแก่น",16.4322,102.8236],["อุดรธานี",17.4139,102.7873],["เลย",17.486,101.7223],["หนองคาย",17.8783,102.742],["มหาสารคาม",16.1852,103.3009],["ร้อยเอ็ด",16.0538,103.652],["กาฬสินธุ์",16.4315,103.506],["สกลนคร",17.1545,104.1479],["นครพนม",17.4107,104.7791],["มุกดาหาร",16.5453,104.7239],["บึงกาฬ",18.3609,103.6465],["เชียงใหม่",18.7883,98.9853],["ลำพูน",18.5744,99.0087],["ลำปาง",18.2888,99.4909],["อุตรดิตถ์",17.62,100.0993],["แพร่",18.1445,100.1405],["น่าน",18.7756,100.773],["พะเยา",19.1664,99.9017],["เชียงราย",19.9105,99.8406],["แม่ฮ่องสอน",19.302,97.9654],["นครสวรรค์",15.703,100.1367],["อุทัยธานี",15.3835,100.0248],["กำแพงเพชร",16.4827,99.5226],["ตาก",16.884,99.1258],["สุโขทัย",17.0068,99.8265],["พิษณุโลก",16.8211,100.2659],["พิจิตร",16.4381,100.3488],["เพชรบูรณ์",16.4194,101.1591],["นครศรีธรรมราช",8.4304,99.9633],["กระบี่",8.0863,98.9063],["พังงา",8.4509,98.5298],["ภูเก็ต",7.8804,98.3923],["สุราษฎร์ธานี",9.1382,99.3215],["ระนอง",9.9528,98.6084],["ชุมพร",10.493,99.18],["สงขลา",7.1897,100.5951],["สตูล",6.6238,100.0674],["ตรัง",7.5563,99.6114],["พัทลุง",7.6167,100.0742],["ปัตตานี",6.8693,101.2506],["ยะลา",6.541,101.2801],["นราธิวาส",6.4254,101.8253]];
+var PLACE_INTL = [["เวียงจันทน์ · ลาว",17.9757,102.6331,7],["พนมเปญ · กัมพูชา",11.5564,104.9282,7],["ย่างกุ้ง · เมียนมา",16.8409,96.1735,6.5],["ฮานอย · เวียดนาม",21.0278,105.8342,7],["โฮจิมินห์ · เวียดนาม",10.8231,106.6297,7],["กัวลาลัมเปอร์ · มาเลเซีย",3.139,101.6869,8],["สิงคโปร์",1.3521,103.8198,8],["จาการ์ตา · อินโดนีเซีย",-6.2088,106.8456,7],["มะนิลา · ฟิลิปปินส์",14.5995,120.9842,8],["ปักกิ่ง · จีน",39.9042,116.4074,8],["เซี่ยงไฮ้ · จีน",31.2304,121.4737,8],["ฮ่องกง",22.3193,114.1694,8],["ไทเป · ไต้หวัน",25.033,121.5654,8],["โตเกียว · ญี่ปุ่น",35.6762,139.6503,9],["โซล · เกาหลีใต้",37.5665,126.978,9],["นิวเดลี · อินเดีย",28.6139,77.209,5.5],["มุมไบ · อินเดีย",19.076,72.8777,5.5],["ธากา · บังกลาเทศ",23.8103,90.4125,6],["การาจี · ปากีสถาน",24.8607,67.0011,5],["ดูไบ · สหรัฐอาหรับเอมิเรตส์",25.2048,55.2708,4],["ริยาด · ซาอุดีอาระเบีย",24.7136,46.6753,3],["อิสตันบูล · ตุรกี",41.0082,28.9784,3],["ลอนดอน · สหราชอาณาจักร",51.5074,-0.1278,0],["ปารีส · ฝรั่งเศส",48.8566,2.3522,1],["เบอร์ลิน · เยอรมนี",52.52,13.405,1],["โรม · อิตาลี",41.9028,12.4964,1],["มาดริด · สเปน",40.4168,-3.7038,1],["อัมสเตอร์ดัม · เนเธอร์แลนด์",52.3676,4.9041,1],["มอสโก · รัสเซีย",55.7558,37.6173,3],["สตอกโฮล์ม · สวีเดน",59.3293,18.0686,1],["ซูริค · สวิตเซอร์แลนด์",47.3769,8.5417,1],["นิวยอร์ก · สหรัฐอเมริกา",40.7128,-74.006,-5],["ลอสแอนเจลิส · สหรัฐอเมริกา",34.0522,-118.2437,-8],["ชิคาโก · สหรัฐอเมริกา",41.8781,-87.6298,-6],["โตรอนโต · แคนาดา",43.6532,-79.3832,-5],["แวนคูเวอร์ · แคนาดา",49.2827,-123.1207,-8],["เม็กซิโกซิตี · เม็กซิโก",19.4326,-99.1332,-6],["เซาเปาโล · บราซิล",-23.5505,-46.6333,-3],["บัวโนสไอเรส · อาร์เจนตินา",-34.6037,-58.3816,-3],["ซิดนีย์ · ออสเตรเลีย",-33.8688,151.2093,10],["เมลเบิร์น · ออสเตรเลีย",-37.8136,144.9631,10],["โอ๊คแลนด์ · นิวซีแลนด์",-36.8485,174.7633,12],["ไคโร · อียิปต์",30.0444,31.2357,2],["โจฮันเนสเบิร์ก · แอฟริกาใต้",-26.2041,28.0473,2],["ลากอส · ไนจีเรีย",6.5244,3.3792,1],["ไนโรบี · เคนยา",-1.2921,36.8219,3]];
+// Mirrors app.html's isCompleteProfile()/isKnownPlace() exactly (same rules, not
+// stricter, not looser) so a profile judged "complete" here is also judged complete
+// there -- that agreement is what keeps /app and /member from ever redirecting to
+// each other in a loop.
+function isPlainInteger(v) { return typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v); }
+function isRealCalendarDate(y, mo, d) {
+  if (!isPlainInteger(y) || !isPlainInteger(mo) || !isPlainInteger(d)) return false;
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+  var dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+function isKnownPlaceName(name) {
+  return PLACE_TH.some(function (row) { return row[0] === name; }) ||
+    PLACE_INTL.some(function (row) { return row[0] === name; });
+}
+function isProfileComplete(profile) {
+  if (!profile) return false;
+  var fullName = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
+  if (!fullName) return false;
+  if (profile.gender !== 'm' && profile.gender !== 'f') return false;
+  if (!isKnownPlaceName(profile.birthPlace)) return false;
+  if (!isRealCalendarDate(profile.birthYear, profile.birthMonth, profile.birthDay)) return false;
+  if (!profile.timeUnknown) {
+    if (!isPlainInteger(profile.birthHour) || profile.birthHour < 0 || profile.birthHour > 23) return false;
+    if (!isPlainInteger(profile.birthMinute) || profile.birthMinute < 0 || profile.birthMinute > 59) return false;
+  }
+  return true;
+}
+function fillPlaceOptions() {
+  const select = document.getElementById('pPlace');
+  if (!select || select.dataset.filled) return;
+  select.dataset.filled = '1';
+  const th = PLACE_TH.slice().sort((a, b) => a[0].localeCompare(b[0], 'th'));
+  const intl = PLACE_INTL.slice().sort((a, b) => a[0].localeCompare(b[0], 'th'));
+  const groupTh = document.createElement('optgroup');
+  groupTh.label = 'ประเทศไทย (77 จังหวัด) — เรียง ก-ฮ';
+  th.forEach((row) => {
+    const opt = document.createElement('option');
+    opt.value = row[0]; opt.textContent = row[0];
+    opt.dataset.lat = row[1]; opt.dataset.lng = row[2]; opt.dataset.tz = 7;
+    if (row[0] === 'กรุงเทพมหานคร') opt.selected = true;
+    groupTh.appendChild(opt);
+  });
+  select.appendChild(groupTh);
+  const groupIntl = document.createElement('optgroup');
+  groupIntl.label = 'ต่างประเทศ — เรียง ก-ฮ';
+  intl.forEach((row) => {
+    const opt = document.createElement('option');
+    opt.value = row[0]; opt.textContent = row[0];
+    opt.dataset.lat = row[1]; opt.dataset.lng = row[2]; opt.dataset.tz = row[3];
+    groupIntl.appendChild(opt);
+  });
+  select.appendChild(groupIntl);
+}
+// Selects the option matching `name` exactly; if none matches (an older profile saved
+// before this dropdown existed, as free text), leaves the select unselected -- its
+// `required` attribute then blocks re-saving until the member picks a real option --
+// and shows a one-time note asking them to confirm/reselect their birthplace.
+function selectPlaceByValue(name) {
+  const select = document.getElementById('pPlace');
+  const note = document.getElementById('pPlaceMismatchNote');
+  select.selectedIndex = -1;
+  for (let i = 0; i < select.options.length; i++) {
+    if (select.options[i].value === name) { select.selectedIndex = i; break; }
+  }
+  if (note) {
+    if (select.selectedIndex === -1 && name) {
+      note.textContent = 'ระบบปรับปรุงรายการสถานที่เกิด กรุณายืนยันสถานที่เกิดของคุณอีกครั้ง (ค่าเดิมที่บันทึกไว้: ' + name + ')';
+      note.hidden = false;
+    } else {
+      note.hidden = true;
+    }
+  }
+}
+
 function initFormOptions() {
   const day = document.getElementById('pDay'), month = document.getElementById('pMonth'), year = document.getElementById('pYear');
   const hour = document.getElementById('pHour'), minute = document.getElementById('pMinute');
@@ -130,6 +213,7 @@ function initFormOptions() {
   fillOptions(year, currentYear - 1900 + 1, currentYear, v => v + ' (พ.ศ. ' + (v + 543) + ')', -1);
   fillOptions(hour, 24, 0, pad2);
   fillOptions(minute, 60, 0, pad2);
+  fillPlaceOptions();
   const syncDays = () => {
     const y = parseInt(year.value, 10) || currentYear, m = parseInt(month.value, 10) || 1;
     const max = daysInMonth(y, m), keep = Math.min(parseInt(day.value, 10) || 1, max);
@@ -151,7 +235,7 @@ function fillFormFrom(profile) {
   document.getElementById('pYear').value = profile.birthYear;
   document.getElementById('pHour').value = profile.birthHour;
   document.getElementById('pMinute').value = profile.birthMinute;
-  document.getElementById('pPlace').value = profile.birthPlace;
+  selectPlaceByValue(profile.birthPlace);
   document.getElementById('pGender').value = profile.gender;
   document.getElementById('pFirstName').value = profile.firstName || '';
   document.getElementById('pLastName').value = profile.lastName || '';
@@ -182,13 +266,17 @@ function showForm(profile) {
   profileCancel.hidden = !profile;
 }
 let currentProfile = null;
-async function loadProfile() {
+async function loadProfile(isEdit) {
   initFormOptions();
   try {
     const response = await fetch('/api/member/profile', { credentials: 'same-origin', cache: 'no-store' });
     const data = await response.json();
     if (!response.ok || data.ok !== true) throw new Error('unavailable');
     currentProfile = data.profile;
+    // Fresh arrival here (no ?edit=1) with an already-complete profile has nothing to
+    // do on /member -- go straight to /app. A visit carrying ?edit=1 (the "แก้ไขข้อมูล"
+    // link on /app) always stays here to edit, even when the profile is complete.
+    if (!isEdit && isProfileComplete(currentProfile)) { location.href = '/app'; return; }
     if (currentProfile) showSummary(currentProfile); else showForm(null);
   } catch { profileErr.hidden = false; profileErr.textContent = 'โหลดข้อมูลเกิดไม่สำเร็จ กรุณาลองใหม่'; }
 }
@@ -220,6 +308,10 @@ profileForm.addEventListener('submit', async (e) => {
     if (!response.ok || data.ok !== true) throw new Error(data.error || 'save_failed');
     currentProfile = data.profile;
     showSummary(currentProfile);
+    // Whether this was the first-time intake or a later edit, a successful save always
+    // has somewhere real to go next: back to /app to see the chart from the saved data.
+    location.href = '/app';
+    return;
   } catch (err) { profileErr.hidden = false; profileErr.textContent = (err && err.message) || 'บันทึกไม่สำเร็จ กรุณาลองใหม่'; }
   finally { profileSubmit.disabled = false; }
 });
@@ -231,18 +323,28 @@ async function refresh() {
     const data = await response.json();
     if (data.ok !== true) throw new Error('unavailable');
     signIn.hidden = data.signedIn; account.hidden = !data.signedIn;
-    const result = new URLSearchParams(location.search).get('login');
+    const params = new URLSearchParams(location.search);
+    const result = params.get('login');
+    const isEdit = params.get('edit') === '1';
     message.textContent = data.signedIn ? 'ยินดีต้อนรับสู่บัญชี LUMA' : result === 'failed'
       ? 'เข้าสู่ระบบไม่สำเร็จ กรุณาลองอีกครั้ง' : result === 'cancelled' ? 'คุณยกเลิกการเข้าสู่ระบบ' : 'ยินดีต้อนรับสู่ LUMA';
-    history.replaceState(null, '', location.pathname);
-    if (data.signedIn) await loadProfile();
+    // Preserve ?edit=1 across the strip so a refresh mid-edit stays on /member instead
+    // of being auto-forwarded to /app (login=... is one-time and always dropped here).
+    history.replaceState(null, '', location.pathname + (isEdit ? '?edit=1' : ''));
+    if (data.signedIn) await loadProfile(isEdit);
   } catch { signIn.hidden=true; account.hidden=true; message.textContent='ระบบสมาชิกยังไม่พร้อมใช้งาน กรุณากลับมาใหม่ภายหลัง'; }
 }
 signOut.addEventListener('click', async () => {
   signOut.disabled = true;
   try {
     const response = await fetch('/api/auth/logout', {method:'POST', credentials:'same-origin'});
-    if (!response.ok) throw new Error('unavailable');
+    let data = null;
+    try { data = await response.json(); } catch {}
+    if (!response.ok || !data || data.ok !== true) throw new Error('unavailable');
+    // Same per-tab reading cache /app uses — clear it here too so the next signed-in
+    // account in this tab never lands on /app and sees a previous member's cached AI
+    // reading before they've clicked anything themselves.
+    try { sessionStorage.removeItem('luma_reading_cache_v1'); } catch {}
     await refresh();
   } catch { message.textContent='ออกจากระบบไม่สำเร็จ กรุณาลองอีกครั้ง'; }
   finally { signOut.disabled=false; }

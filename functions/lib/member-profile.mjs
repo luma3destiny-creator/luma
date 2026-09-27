@@ -1,5 +1,6 @@
 import { authOrigin, sameOrigin, json, currentMember, nowSeconds } from './member-session.mjs';
 import { isRealCalendarDate, toBangkokYmd } from './age.mjs';
+import { VALID_PLACE_NAMES } from './birth-places.mjs';
 
 const unavailable = () => json({ ok: false, error: 'ระบบสมาชิกยังไม่พร้อมใช้งาน' }, 503);
 const invalid = (message) => json({ ok: false, error: message || 'ข้อมูลไม่ถูกต้อง' }, 400);
@@ -74,7 +75,14 @@ function validateProfileInput(body) {
     if (minute < 0 || minute > 59) return { error: 'เวลาเกิด (นาที) ไม่ถูกต้อง' };
   }
 
-  if (!place || place.length > 200) return { error: 'กรุณากรอกสถานที่เกิด' };
+  if (!place) return { error: 'กรุณาเลือกสถานที่เกิด' };
+  // Restricted to the exact place list #bplace (app.html) and #pPlace (member.html)
+  // both populate their dropdown from — this is what lets /app's auto-view flow trust
+  // a saved place will always resolve to a real lat/lng/timezone, with no guessing.
+  // Rows saved before this check existed may hold an older free-text value outside this
+  // list; those are left as-is here and are handled client-side by asking the member to
+  // reselect once (isKnownPlace() in app.html), never by rejecting or silently guessing.
+  if (!VALID_PLACE_NAMES.has(place)) return { error: 'กรุณาเลือกสถานที่เกิดจากรายการที่ระบบรองรับ' };
   if (gender !== 'm' && gender !== 'f') return { error: 'กรุณาเลือกเพศกำเนิด' };
 
   const first = normalizeName(firstName);
