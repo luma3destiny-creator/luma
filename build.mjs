@@ -32,6 +32,7 @@ const OUT = join(ROOT, 'dist');
 const ALLOW = [
   'index.html',              // landing page
   'app.html',                // the app itself (served at /app and /app.html)
+  'member.html',             // membership entry, gated by server-side feature flag
   'privacy.html',            // linked from index.html and app.html
   'Logo/luma_icon_gold.png', // the only image any published page references
 ];

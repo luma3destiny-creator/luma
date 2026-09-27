@@ -1,0 +1,15 @@
+{
+  "name": "luma-web",
+  "private": true,
+  "scripts": {
+    "build": "node build.mjs",
+    "test:membership": "node --test tests/membership/*.mjs",
+    "build:membership-smoke": "node tests/membership/workerd/build.mjs"
+  },
+  "dependencies": {
+    "jose": "6.2.12"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

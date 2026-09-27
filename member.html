@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>บัญชีของฉัน · LUMA</title>
+  <style>
+    :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131c;color:#f8f4e9}
+    *{box-sizing:border-box}body{margin:0;padding:28px 18px;min-height:100svh;display:grid;place-items:center}
+    main{width:100%;max-width:440px;background:#1a1d28;border:1px solid #3e3b35;border-radius:24px;padding:32px}
+    .brand{color:#dbc089;letter-spacing:6px;font-size:22px;text-decoration:none}h1{font-size:27px;margin:28px 0 12px}
+    p{line-height:1.8;color:#cac5ba}button{width:100%;padding:15px;border:1px solid transparent;border-radius:10px;font:inherit;font-weight:600;cursor:pointer;margin:6px 0}
+    button:disabled{opacity:.5;cursor:wait}.line{background:#06c755;color:#fff}.google{background:#fff;color:#1f1f1f;border-color:#747775}
+    .logout{background:transparent;border-color:#7d7057;color:#f8f4e9}a{color:#e7c98c}footer{font-size:13px;margin-top:28px}
+    #message{min-height:1.8em}button:focus-visible,a:focus-visible{outline:3px solid #ebc97d;outline-offset:4px}[hidden]{display:none!important}
+  </style>
+</head>
+<body><main>
+  <a class="brand" href="/">LUMA</a>
+  <h1>บัญชีของฉัน</h1>
+  <p id="message" role="status" aria-live="polite">กำลังตรวจสอบสถานะบัญชี…</p>
+  <section id="signIn" hidden>
+    <p>เลือกช่องทางเข้าสู่ระบบของคุณ</p>
+    <form method="post" action="/api/auth/line/start"><button class="line" type="submit">เข้าสู่ระบบด้วย LINE</button></form>
+    <form method="post" action="/api/auth/google/start"><button class="google" type="submit">เข้าสู่ระบบด้วย Google</button></form>
+  </section>
+  <section id="account" hidden>
+    <p>คุณเข้าสู่ระบบแล้ว ส่วนโปรไฟล์ข้อมูลเกิดและประวัติรายงานกำลังเตรียมเปิดใช้งาน</p>
+    <button id="logout" class="logout" type="button">ออกจากระบบ</button>
+  </section>
+  <footer><a href="/privacy">ความเป็นส่วนตัว</a> · <a href="/app">กลับไปหน้า LUMA</a></footer>
+</main>
+<script>
+const message = document.getElementById('message');
+const signIn = document.getElementById('signIn');
+const account = document.getElementById('account');
+const signOut = document.getElementById('logout');
+async function refresh() {
+  try {
+    const response = await fetch('/api/auth/me', {credentials:'same-origin', cache:'no-store'});
+    if (!response.ok) throw new Error('unavailable');
+    const data = await response.json();
+    if (data.ok !== true) throw new Error('unavailable');
+    signIn.hidden = data.signedIn; account.hidden = !data.signedIn;
+    const result = new URLSearchParams(location.search).get('login');
+    message.textContent = data.signedIn ? 'ยินดีต้อนรับสู่บัญชี LUMA' : result === 'failed'
+      ? 'เข้าสู่ระบบไม่สำเร็จ กรุณาลองอีกครั้ง' : result === 'cancelled' ? 'คุณยกเลิกการเข้าสู่ระบบ' : 'ยินดีต้อนรับสู่ LUMA';
+    history.replaceState(null, '', location.pathname);
+  } catch { signIn.hidden=true; account.hidden=true; message.textContent='ระบบสมาชิกยังไม่พร้อมใช้งาน กรุณากลับมาใหม่ภายหลัง'; }
+}
+signOut.addEventListener('click', async () => {
+  signOut.disabled = true;
+  try {
+    const response = await fetch('/api/auth/logout', {method:'POST', credentials:'same-origin'});
+    if (!response.ok) throw new Error('unavailable');
+    await refresh();
+  } catch { message.textContent='ออกจากระบบไม่สำเร็จ กรุณาลองอีกครั้ง'; }
+  finally { signOut.disabled=false; }
+});
+refresh();
+</script>
+</body></html>
