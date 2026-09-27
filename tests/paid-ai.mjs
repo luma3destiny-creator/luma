@@ -6,7 +6,11 @@ import { onRequestPost as compat } from '../functions/api/compat.js';
 import { onRequestPost as vision } from '../functions/api/analyze-vision.js';
 test('both paid AI handlers require a paid token with a valid future expiry',async()=>{
  const {DB,raw}=openD1(':memory:');
- raw.exec("CREATE TABLE payments(id INTEGER PRIMARY KEY,token TEXT,status TEXT,expires_at TEXT)");
+ // owner_user_id (migrations/015_payments_owner.sql) must exist here too --
+ // checkPaidAccess now always selects it, and every row below leaves it
+ // NULL (unowned), which is exactly what makes token-only access keep
+ // working unchanged for every case this file already covers.
+ raw.exec("CREATE TABLE payments(id INTEGER PRIMARY KEY,token TEXT,status TEXT,expires_at TEXT,owner_user_id TEXT)");
  // Paid AI calls now also need the quota table; without it they refuse (tests/ai-quota covers that).
  raw.exec(readFileSync(new URL('../migrations/009_ai_quota.sql', import.meta.url),'utf8'));
  const insert=raw.prepare('INSERT INTO payments(token,status,expires_at) VALUES(?,?,?)');

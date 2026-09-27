@@ -21,7 +21,8 @@
 
 export async function onRequestGet(context) {
   const { env } = context;
-  const mode = env.OTP_RECOVERY_ENABLED === 'true' ? 'otp' : 'phone';
+  const mode = env.PURCHASE_RECOVERY_DISABLED === 'true' ? 'closed'
+    : env.OTP_RECOVERY_ENABLED === 'true' ? 'otp' : 'phone';
   return new Response(JSON.stringify({ mode }), {
     status: 200,
     headers: {

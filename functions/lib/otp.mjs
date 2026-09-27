@@ -1,7 +1,5 @@
-// functions/lib/otp.mjs — one-time codes for recovering access.
-//
-// Replaces the old "give me a phone number and I'll give you a token" recovery,
-// which let anyone who knew a customer's phone number take over their access.
+// functions/lib/otp.mjs — one-time codes for recovering access, and for
+// linking an old, pre-membership purchase to a signed-in member account.
 //
 // Three properties this file exists to hold:
 //
@@ -23,6 +21,16 @@
 //    only rows that actually reserved a send. Reserving it at insert time would
 //    let a stranger's request consume a customer's budget; counting it after the
 //    send would race.
+//
+// PURPOSE SEPARATION. Every challenge row is scoped, from the moment it is
+// created, to exactly one purpose: 'recovery' (the phone/OTP recovery flow,
+// pre-login) or 'link_purchase' (a signed-in member attaching an old order to
+// their own account). consumeChallengeByPublicId refuses to consume a row for
+// the wrong purpose, so a code sent for one flow can never be replayed into
+// the other — a recovery code cannot be used to link an account, and a link
+// code cannot be used to recover raw access. For 'link_purchase', the row also
+// carries user_id and payment_id, both decided and stored at REQUEST time
+// (never re-derived at confirm time) — see applyOwnerToOrder below for why.
 
 export const OTP_POLICY = {
   codeLength: 6,
@@ -115,15 +123,22 @@ function lastIdOf(result) {
  * Why for everyone: so that a number nobody has ever paid with is throttled
  * exactly like a customer's number. See the header note.
  *
+ * `purpose` scopes the row (see the file header); `userId`/`paymentId` are
+ * only ever set for purpose='link_purchase' and are opaque to this function.
+ * The throttles below are deliberately NOT scoped by purpose: a phone number
+ * that can get 3 recovery codes an hour must not ALSO get 3 link codes on
+ * top of that from the same number — one SMS budget per phone, regardless of
+ * which flow is asking.
+ *
  * Returns { ok:true, publicId, challengeId } or { ok:false, reason }.
  */
-export async function reserveRequestSlot(env, { phoneHash, ipHash, codeHash }) {
+export async function reserveRequestSlot(env, { phoneHash, ipHash, codeHash, purpose = 'recovery', userId = null, paymentId = null }) {
   const publicId = crypto.randomUUID();
 
   const res = await env.DB.prepare(
     `INSERT INTO otp_challenges
-        (public_id, phone_hash, ip_hash, code_hash, created_at, expires_at, attempts, sms_reserved)
-     SELECT ?1, ?2, ?3, ?4, datetime('now'), datetime('now', '+${OTP_POLICY.ttlSeconds} seconds'), 0, 0
+        (public_id, phone_hash, ip_hash, code_hash, created_at, expires_at, attempts, sms_reserved, purpose, user_id, payment_id)
+     SELECT ?1, ?2, ?3, ?4, datetime('now'), datetime('now', '+${OTP_POLICY.ttlSeconds} seconds'), 0, 0, ?7, ?8, ?9
       WHERE (SELECT COUNT(*) FROM otp_challenges
               WHERE phone_hash = ?2 AND created_at > datetime('now','-1 hour')) < ?5
         AND (SELECT COUNT(*) FROM otp_challenges
@@ -133,7 +148,8 @@ export async function reserveRequestSlot(env, { phoneHash, ipHash, codeHash }) {
                 AND created_at > datetime('now','-${OTP_POLICY.minSecondsBetweenSends} seconds'))`
   ).bind(
     publicId, phoneHash, ipHash, codeHash,
-    OTP_POLICY.maxSendsPerPhonePerHour, OTP_POLICY.maxSendsPerIpPerHour
+    OTP_POLICY.maxSendsPerPhonePerHour, OTP_POLICY.maxSendsPerIpPerHour,
+    purpose, userId, paymentId
   ).run();
 
   if (changesOf(res) === 0) return { ok: false, reason: 'throttled' };
@@ -227,18 +243,27 @@ export async function recordSendOutcome(env, challengeId, { provider, status, re
  * The same condition is what stops an older challenge from overwriting a newer
  * token: only the newest challenge can ever reach `payments`.
  *
- * CRASH WINDOW. Consuming the code and writing the new token onto the payment
- * row are two different writes, and the worker can die between them. If that
- * happened and the code were simply burned, the customer would have paid, held
- * a valid code, and still got nothing. So the token to be issued is decided and
- * stored ON THE CHALLENGE in the same statement that consumes it, and
- * `token_applied` records whether it reached `payments`. A retry with the same
- * code then finishes the job and returns the SAME token — which is idempotent
- * recovery, not a second grant.
+ * PURPOSE. `purpose` must match the row's own purpose exactly, or this refuses
+ * the same as a wrong code -- a recovery challenge's public_id/code can never
+ * be consumed as a link_purchase, and vice versa. For purpose='link_purchase'
+ * the caller ALSO passes `userId`, which must match the row's own user_id
+ * (the account that requested the link, bound at request time) -- so even a
+ * link challenge's own owner cannot have it confirmed by a different signed-in
+ * account than the one that asked for the code.
  *
- * Returns { ok, challengeId, token, replay } or { ok:false, reason }.
+ * CRASH WINDOW. Consuming the code and writing the outcome (a token onto a
+ * payment row, or ownership onto one) are two different writes, and the worker
+ * can die between them. So the outcome to be applied is decided and stored ON
+ * THE CHALLENGE in the same statement that consumes it, and `token_applied`
+ * records whether it was actually applied. A retry with the same code then
+ * finishes the job — idempotent completion, not a second grant. (For
+ * 'link_purchase' the stored `issued_token` is never itself used for
+ * anything; it only exists to make the replay/idempotency mechanics below
+ * identical for both purposes. See applyOwnerToOrder.)
+ *
+ * Returns { ok, challengeId, token, paymentId, replay } or { ok:false, reason }.
  */
-export async function consumeChallengeByPublicId(env, { publicId, codeHash, candidateToken }) {
+export async function consumeChallengeByPublicId(env, { publicId, codeHash, candidateToken, purpose = 'recovery', userId = null }) {
   // Reserve an attempt. The guards are part of the write, so N parallel
   // guesses consume N attempts and stop exactly at the limit.
   const attempt = await env.DB.prepare(
@@ -258,26 +283,35 @@ export async function consumeChallengeByPublicId(env, { publicId, codeHash, cand
   if (changesOf(attempt) === 0) return { ok: false, reason: 'not_attemptable' };
 
   const row = await env.DB.prepare(
-    `SELECT id, code_hash, consumed_at, issued_token, token_applied
+    `SELECT id, code_hash, consumed_at, issued_token, token_applied, purpose, user_id, payment_id
        FROM otp_challenges WHERE public_id = ? LIMIT 1`
   ).bind(publicId).first();
   if (!row) return { ok: false, reason: 'not_found' };
 
+  // Purpose/owner scoping happens before the code comparison, same as any
+  // other rejection here: one message for every failure mode at the call
+  // site, so this ordering leaks nothing extra.
+  if (row.purpose !== purpose) return { ok: false, reason: 'wrong_purpose' };
+  if (purpose === 'link_purchase' && String(row.user_id || '') !== String(userId || '')) {
+    return { ok: false, reason: 'wrong_account' };
+  }
+
   if (!timingSafeEqual(row.code_hash, codeHash)) return { ok: false, reason: 'wrong_code' };
 
-  // Recovery path: this code was already accepted, but the token never reached
-  // the payment row. Hand back the same token and let the caller finish.
+  // Recovery path: this code was already accepted, but the outcome never
+  // reached its target. Hand back the same token and let the caller finish.
   //
   // There is deliberately no time window here. A clock cannot tell a run that
   // died from a run that is merely slow -- a stalled request is still stalled
   // after ten seconds, or ten minutes -- so the safety is not in WHEN this
-  // fires but in what the write itself is allowed to do: see applyTokenToOrder,
-  // which refuses any challenge that is no longer the newest for that number.
-  // A duplicate submission racing the original therefore gets the SAME token
-  // back, never a second one, and a stalled older request can never land on top
-  // of a token issued since.
+  // fires but in what the write itself is allowed to do: see applyTokenToOrder
+  // / applyOwnerToOrder, each of which refuses any challenge that is no longer
+  // the newest for that number, or that has already been applied. A duplicate
+  // submission racing the original therefore gets the SAME outcome back,
+  // never a second one, and a stalled older request can never land on top of
+  // an outcome issued since.
   if (row.consumed_at && Number(row.token_applied) === 0 && row.issued_token) {
-    return { ok: true, challengeId: row.id, token: row.issued_token, replay: true };
+    return { ok: true, challengeId: row.id, token: row.issued_token, paymentId: row.payment_id, replay: true };
   }
 
   const consume = await env.DB.prepare(
@@ -287,7 +321,7 @@ export async function consumeChallengeByPublicId(env, { publicId, codeHash, cand
   ).bind(candidateToken, publicId).run();
 
   if (changesOf(consume) === 0) return { ok: false, reason: 'already_used' };
-  return { ok: true, challengeId: row.id, token: candidateToken, replay: false };
+  return { ok: true, challengeId: row.id, token: candidateToken, paymentId: row.payment_id, replay: false };
 }
 
 /**
@@ -335,6 +369,134 @@ export async function applyTokenToOrder(env, { publicId, orderId, token }) {
     `UPDATE otp_challenges SET token_applied = 1, issued_token = NULL WHERE public_id = ?`
   ).bind(publicId).run();
   return { applied: true };
+}
+
+/**
+ * Write this challenge's OWN bound payment_id/user_id onto `payments.owner_user_id`
+ * -- the link-flow analogue of applyTokenToOrder above, with the identical
+ * crash-safety shape:
+ *
+ *   - the row to link and the account to link it to are NOT re-derived here.
+ *     Both are read from the challenge itself (payment_id, user_id), exactly as
+ *     they were decided and stored at REQUEST time by requestLinkOtp. There is
+ *     no "pick the latest still-unlinked order" query anywhere in this
+ *     function -- the whole point is that the order a code was sent about
+ *     cannot silently change to a different one between request and confirm.
+ *   - `owner_user_id IS NULL` in the WHERE clause is what makes two concurrent
+ *     link attempts for orders that happen to name the same payment_id safe:
+ *     only the first UPDATE to actually run can win: the second finds
+ *     owner_user_id no longer NULL and writes nothing.
+ *   - `status = 'paid' AND datetime(expires_at) > datetime('now')` is the
+ *     same fail-closed expiry rule every paid API uses -- a code accepted
+ *     while the order was live must not still grant ownership of an order
+ *     that has since expired, been refunded, or been cancelled.
+ *   - `c.consumed_at IS NOT NULL` is the property that actually proves a
+ *     code was verified for THIS challenge. It is checked here, in the
+ *     write itself, rather than trusted from the caller's own call order --
+ *     confirmLinkOtp always calls consumeChallengeByPublicId first today,
+ *     but this function must not depend on that being true; a fresh,
+ *     never-consumed challenge (consumed_at IS NULL) must never be able to
+ *     write ownership just because something else called this directly.
+ *   - `token_applied = 0` + the "no newer challenge for this phone" guard is
+ *     the exact same replay/staleness protection applyTokenToOrder uses, so a
+ *     process that dies after consumeChallengeByPublicId but before this call
+ *     resumes safely on retry: the caller re-consumes (gets the replay branch
+ *     above, same token back) and calls this again, which is a no-op if it
+ *     already succeeded, or completes the job if it did not.
+ *
+ * RETRY AFTER THE OWNER WRITE SUCCEEDED BUT token_applied NEVER GOT SET.
+ * The crash this function survives can land between its own two statements:
+ * `payments.owner_user_id` gets written, then the process dies before
+ * `token_applied` is marked. The retry below must finish that exact
+ * interrupted write -- and ONLY that -- without assuming that "owner_user_id
+ * already equals this challenge's user_id" proves THIS challenge is the one
+ * that set it: two different challenges can legitimately share the same
+ * user_id/payment_id (the same member asking to link the same still-unlinked
+ * order twice before either is confirmed), so that equality alone proves
+ * nothing about which challenge actually ran the write. What DOES prove it is
+ * checking, on retry, every precondition the write itself required, applied
+ * to THIS challenge specifically: it must still be consumed
+ * (`consumed_at IS NOT NULL` -- a code was genuinely verified for this exact
+ * challenge, never assumed from call order), still current (not superseded
+ * by a newer request for the same phone), and not yet marked applied. A
+ * challenge that fails any of those was never the one whose write this is,
+ * so it is never finished here even if the order happens to already be
+ * owned by its account through a different, equally-valid challenge.
+ *
+ * Returns { applied: true } once owner_user_id is set (on this call or an
+ * earlier one that crashed before marking token_applied), or
+ * { applied: false } if there was nothing valid left to apply -- the order is
+ * already linked (to this account or another), no longer paid/live, the
+ * challenge is stale, unconsumed, or was never a valid link challenge.
+ */
+export async function applyOwnerToOrder(env, { publicId }) {
+  const res = await env.DB.prepare(
+    `UPDATE payments
+        SET owner_user_id = (SELECT user_id FROM otp_challenges WHERE public_id = ?1)
+      WHERE owner_user_id IS NULL
+        AND status = 'paid'
+        AND datetime(expires_at) > datetime('now')
+        AND id = (SELECT payment_id FROM otp_challenges WHERE public_id = ?1)
+        AND EXISTS (
+              SELECT 1 FROM otp_challenges c
+               WHERE c.public_id = ?1
+                 AND c.purpose = 'link_purchase'
+                 AND c.payment_id IS NOT NULL
+                 AND c.user_id IS NOT NULL
+                 AND c.consumed_at IS NOT NULL
+                 AND c.token_applied = 0
+                 AND NOT EXISTS (
+                       SELECT 1 FROM otp_challenges n
+                        WHERE n.phone_hash = c.phone_hash
+                          AND n.id > c.id
+                          AND n.send_status IN ('sent', 'unknown')))`
+  ).bind(publicId).run();
+
+  if (changesOf(res) > 0) {
+    // Only now stop holding the token on the challenge -- same shape as
+    // applyTokenToOrder. If the worker dies between these two statements,
+    // `payments.owner_user_id` is already written and the branch below is
+    // what finishes the job on retry.
+    await env.DB.prepare(
+      `UPDATE otp_challenges SET token_applied = 1, issued_token = NULL WHERE public_id = ?`
+    ).bind(publicId).run();
+    return { applied: true };
+  }
+
+  // The write above changed nothing just now. Find out whether that is a
+  // genuine refusal or the interrupted-retry case -- by re-checking THIS
+  // challenge against every precondition the write itself requires, never
+  // by inferring success from the order's current owner alone.
+  const row = await env.DB.prepare(
+    `SELECT p.owner_user_id, c.user_id, c.payment_id, c.token_applied, c.consumed_at,
+            NOT EXISTS (
+                  SELECT 1 FROM otp_challenges n
+                   WHERE n.phone_hash = c.phone_hash
+                     AND n.id > c.id
+                     AND n.send_status IN ('sent', 'unknown')) AS still_current
+       FROM otp_challenges c
+       LEFT JOIN payments p ON p.id = c.payment_id
+      WHERE c.public_id = ?1 AND c.purpose = 'link_purchase'`
+  ).bind(publicId).first();
+
+  const thisChallengeWasVerifiedAndEligible =
+    row &&
+    Number(row.token_applied) === 0 &&
+    row.consumed_at != null &&
+    Number(row.still_current) === 1 &&
+    row.payment_id != null;
+
+  const orderAlreadyOwnedByThisAccount =
+    row && row.owner_user_id != null && String(row.owner_user_id) === String(row.user_id);
+
+  if (thisChallengeWasVerifiedAndEligible && orderAlreadyOwnedByThisAccount) {
+    await env.DB.prepare(
+      `UPDATE otp_challenges SET token_applied = 1, issued_token = NULL WHERE public_id = ?`
+    ).bind(publicId).run();
+    return { applied: true };
+  }
+
+  return { applied: false };
 }
 
 /** Close out a challenge that will never hand its token over. */

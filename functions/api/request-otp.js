@@ -43,6 +43,13 @@ export async function onRequestPost(context) {
     return json({ error: 'ระบบไม่พร้อมใช้งานชั่วคราว' }, 503);
   }
 
+  // Hard kill switch, closed server-side -- see check-access.js for why this
+  // is a separate flag from OTP_RECOVERY_ENABLED. Refusing here, before the
+  // phone is even parsed, keeps the response identical for every caller.
+  if (env.PURCHASE_RECOVERY_DISABLED === 'true') {
+    return json({ error: 'ระบบกู้คืนสิทธิ์ด้วย OTP ปิดใช้งานแล้ว กรุณาเข้าสู่ระบบด้วยบัญชีสมาชิกแทน', code: 'RECOVERY_CLOSED' }, 410);
+  }
+
   let body;
   try { body = await request.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
 
@@ -65,7 +72,7 @@ export async function onRequestPost(context) {
 
     // Throttles are RESERVED by the same statement that records the request —
     // see reserveRequestSlot. This runs for every number.
-    const reserved = await reserveRequestSlot(env, { phoneHash, ipHash, codeHash });
+    const reserved = await reserveRequestSlot(env, { phoneHash, ipHash, codeHash, purpose: 'recovery' });
     if (!reserved.ok) {
       const why = await diagnoseBlock(env, { phoneHash, ipHash });
       console.log('request-otp: throttled (' + why.reason + ')');
@@ -73,10 +80,12 @@ export async function onRequestPost(context) {
     }
 
     const local = toLocalThai(e164);
+    // Same fail-closed expiry rule as every paid API and check-access.js:
+    // datetime(expires_at) > datetime('now'), evaluated by the database.
+    // NULL/malformed expires_at never counts as "not expired".
     const row = await env.DB.prepare(
       `SELECT id FROM payments
-        WHERE phone = ? AND status = 'paid'
-          AND (expires_at IS NULL OR expires_at > datetime('now'))
+        WHERE phone = ? AND status = 'paid' AND datetime(expires_at) > datetime('now')
         ORDER BY paid_at DESC LIMIT 1`
     ).bind(local).first();
 

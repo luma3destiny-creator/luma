@@ -31,7 +31,7 @@ export async function onRequestPost(context) {
     }
   }
 
-  const access = await checkPaidAccess(env, token);
+  const access = await checkPaidAccess(context, token);
   if (!access.ok) return json({ error: access.error }, access.status);
 
   const g1 = person1.gender === 'm' ? 'ชาย' : 'หญิง';

@@ -25,6 +25,11 @@ export async function onRequestPost(context) {
     return json({ error: 'ระบบไม่พร้อมใช้งานชั่วคราว' }, 503);
   }
 
+  // Hard kill switch, closed server-side -- see check-access.js.
+  if (env.PURCHASE_RECOVERY_DISABLED === 'true') {
+    return json({ ok: false, error: 'ระบบกู้คืนสิทธิ์ด้วย OTP ปิดใช้งานแล้ว กรุณาเข้าสู่ระบบด้วยบัญชีสมาชิกแทน', code: 'RECOVERY_CLOSED' }, 410);
+  }
+
   let body;
   try { body = await request.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
 
@@ -50,7 +55,8 @@ export async function onRequestPost(context) {
     const result = await consumeChallengeByPublicId(env, {
       publicId: challengeId,
       codeHash,
-      candidateToken: crypto.randomUUID()
+      candidateToken: crypto.randomUUID(),
+      purpose: 'recovery'
     });
     if (!result.ok) {
       // One message for every failure mode: a caller must not learn whether the
@@ -60,10 +66,10 @@ export async function onRequestPost(context) {
     }
 
     const local = toLocalThai(e164);
+    // Same fail-closed expiry rule as request-otp.js and every paid API.
     const row = await env.DB.prepare(
       `SELECT id, expires_at FROM payments
-        WHERE phone = ? AND status = 'paid'
-          AND (expires_at IS NULL OR expires_at > datetime('now'))
+        WHERE phone = ? AND status = 'paid' AND datetime(expires_at) > datetime('now')
         ORDER BY paid_at DESC LIMIT 1`
     ).bind(local).first();
 

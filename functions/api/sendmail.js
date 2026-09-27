@@ -5,6 +5,8 @@
 // matching plain-text alternative. All user- and AI-supplied text is
 // HTML-escaped before being inserted into the markup.
 //
+import { checkPaidAccess } from '../lib/paid-access.mjs';
+
 // Payload (from app.html):
 //   {
 //     email, chargeId,
@@ -50,16 +52,16 @@ export async function onRequestPost(context) {
 
   if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ error: 'Invalid payload' }, 400);
   const { email, token } = body;
-  if (typeof token !== 'string' || !token || token.length > 256 || ['dev', 'dev-token'].includes(token)) {
-    return json({ error: 'กรุณากู้คืนสิทธิ์ก่อนส่งอีเมล' }, 401);
-  }
-  let order;
-  try {
-    order = await env.DB.prepare("SELECT id FROM payments WHERE token = ? AND status = 'paid' AND datetime(expires_at) > datetime('now') LIMIT 1").bind(token).first();
-  } catch {
-    return json({ error: 'ระบบตรวจสิทธิ์ยังไม่พร้อม' }, 503);
-  }
-  if (!order) return json({ error: 'สิทธิ์ไม่ถูกต้องหรือหมดอายุ กรุณากู้คืนสิทธิ์' }, 403);
+  // Same owner/session gate as every other paid endpoint (see
+  // functions/lib/paid-access.mjs's header): a bare token is not enough once
+  // its order is linked to a member account -- the caller must be signed in,
+  // right now, as that exact account. This endpoint used to check only the
+  // token, which let a token that had already stopped working everywhere
+  // else still send email. An unlinked (owner_user_id NULL) row is
+  // unaffected, exactly as before.
+  const access = await checkPaidAccess(context, token);
+  if (!access.ok) return json({ error: access.error }, access.status);
+  const order = { id: access.paymentId };
 
   if (!email) {
     return json({ error: 'กรุณาระบุอีเมล' }, 400);

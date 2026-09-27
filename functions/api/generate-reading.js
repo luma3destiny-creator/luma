@@ -50,7 +50,7 @@ export async function onRequestPost(context) {
   let paidAccess = null;
   if (body.token !== undefined) {
     if (typeof body.token !== 'string') return json({ error: 'ข้อมูลไม่ถูกต้อง' }, 400);
-    const access = await checkPaidAccess(env, body.token);
+    const access = await checkPaidAccess(context, body.token);
     if (!access.ok) return json({ error: access.error }, access.status);
     paidAccess = access;
   }

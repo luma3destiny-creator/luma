@@ -299,7 +299,7 @@ async function recoveryMode(){
   try{
     var r=await fetch("/api/recovery-mode");
     var d=await r.json();
-    _recoveryMode=(d&&d.mode==="phone")?"phone":"otp";
+    _recoveryMode=(d&&d.mode==="closed")?"closed":(d&&d.mode==="phone")?"phone":"otp";
   }catch(e){_recoveryMode="otp";}
   return _recoveryMode;
 }
@@ -340,7 +340,7 @@ window.recoverAccess=async function(){
   }
   err.style.display="none";
   var btns=document.querySelectorAll("#payStep1 button"),i;
-  if(await recoveryMode()==="phone"){ await legacyRecover(ph,err); return; }
+  var _rm=await recoveryMode();if(_rm==="closed"){err.textContent="ระบบกู้คืนสิทธิ์ด้วยเบอร์โทรปิดใช้งานแล้ว กรุณาเข้าสู่ระบบด้วยบัญชีสมาชิก (LINE/Google) แล้วเชื่อมสิทธิ์เดิมที่หน้าสมาชิก";err.style.display="block";return;}if(_rm==="phone"){ await legacyRecover(ph,err); return; }
   for(i=0;i<btns.length;i++)btns[i].disabled=true;
   var out;
   try{out=await otpRequest(ph);}catch(e){out={fatal:"\u0e40\u0e0a\u0e37\u0e48\u0e2d\u0e21\u0e15\u0e48\u0e2d\u0e44\u0e21\u0e48\u0e2a\u0e33\u0e40\u0e23\u0e47\u0e08 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e25\u0e2d\u0e07\u0e43\u0e2b\u0e21\u0e48\u0e2d\u0e35\u0e01\u0e04\u0e23\u0e31\u0e49\u0e07"};}
@@ -1446,6 +1446,23 @@ if("1"===new URLSearchParams(location.search).get("dev")){
     window.__lumaAccountKey = (me.member && me.member.id) ? String(me.member.id) : '';
     if (!me.signedIn) { showIntro(); return; }
 
+    // New-device / already-purchased entitlement: ask the server (never trust a local
+    // token or anything the browser already has) whether THIS signed-in account already
+    // owns a live, paid entitlement -- functions/lib/purchase-link.mjs:findOwnedEntitlement,
+    // read-only, keyed only by the session's own account id. When it does, unlock the
+    // premium tabs the same way a fresh purchase would. Best-effort: any failure here
+    // must never block or alter the free birth-chart flow below.
+    try {
+      var entRes = await fetch('/api/member/entitlement', { credentials: 'same-origin', cache: 'no-store' });
+      var entData = await entRes.json();
+      if (entData && entData.ok && entData.hasEntitlement && entData.token) {
+        try { localStorage.setItem('luma_token', entData.token); } catch (e) { /* private mode etc */ }
+        if (entData.expiresAt && typeof renderExpiryBanner === 'function') renderExpiryBanner(new Date(entData.expiresAt + 'Z'));
+        if (typeof window.unlockPremiumTabs === 'function') window.unlockPremiumTabs();
+        if (typeof window.unlockVisionTabs === 'function') window.unlockVisionTabs();
+      }
+    } catch (e) { /* entitlement check is best-effort; the free reading flow continues regardless */ }
+
     // A signed-in member has no use for the anonymous-visitor pitch (the big logo/
     // tagline and "กรอกวันเกิดและเวลาเกิด") -- shrink it so "ดวงของฉัน"/their birth
     // summary is the first substantial thing they see, whether their profile turns
@@ -1502,6 +1519,15 @@ if("1"===new URLSearchParams(location.search).get("dev")){
         // the session ended — never on a network error or a non-ok response, so a
         // still-signed-in member is never left thinking they logged out.
         try { sessionStorage.removeItem('luma_reading_cache_v1'); } catch (e) { /* private mode etc: nothing to clear */ }
+        // The account-derived token (set only by the signed-in entitlement
+        // check in init() below, or by check-access finding an owner-bound
+        // token) must not linger for whoever signs in next in this tab/
+        // browser. The server-side owner check in checkPaidAccess/
+        // check-access.js is what actually enforces this either way -- a
+        // stale owned token would already fail there -- but clearing it here
+        // too means the UI never even shows a flash of "unlocked" state that
+        // belongs to the account that just signed out.
+        try { localStorage.removeItem('luma_token'); } catch (e) { /* private mode etc */ }
         window.__pendingReadingPayload = null;
         window.__lumaAccountKey = '';
         location.href = '/app';

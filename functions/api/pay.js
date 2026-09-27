@@ -21,6 +21,7 @@
 // comfortable stale tabs older than that window no longer matter.
 
 import { computeAgeAtPurchase } from '../lib/age.mjs';
+import { currentMember, readCookie, validToken, SESSION_COOKIE } from '../lib/member-session.mjs';
 
 export async function onRequestOptions() {
   return cors(null, 204);
@@ -73,6 +74,35 @@ export async function onRequestPost(context) {
     // from the backfill script's own aggregate counts, not per-request).
   }
 
+  // Owner (if any) comes ONLY from this request's own server-side session --
+  // never from anything in the request body, which has no user_id field for
+  // a client to spoof. A signed-out purchase, or one made while membership is
+  // disabled, simply gets no owner (NULL), exactly as it always has.
+  //
+  // The distinction that matters: no session COOKIE at all is a normal,
+  // expected "not signed in" outcome (true on Production today, and true for
+  // every signed-out visitor here) and proceeds unowned, silently, same as
+  // before. A cookie that IS present but whose lookup throws (a DB error,
+  // not "not signed in") must NOT be treated the same way -- silently
+  // falling through to an unowned order would strand a genuinely signed-in
+  // buyer's purchase as unlinked with no signal that anything went wrong.
+  // That case fails the checkout instead.
+  let ownerUserId = null;
+  const hasSessionCookie = validToken(readCookie(request, SESSION_COOKIE));
+  if (hasSessionCookie) {
+    let member;
+    try {
+      member = await currentMember(env, request);
+    } catch (e) {
+      console.error('pay: session lookup failed with a session cookie present -- refusing to create an ownerless order:', e);
+      return json({ error: 'ระบบยังไม่พร้อม กรุณาลองใหม่อีกครั้ง' }, 503);
+    }
+    // member === null here means the cookie did not resolve to an active
+    // session (expired/revoked/unknown) -- a normal "not actually signed in"
+    // outcome, not a failure. Proceeds unowned, exactly like no cookie at all.
+    if (member) ownerUserId = member.id;
+  }
+
   try {
     // Create a Stripe PaymentIntent confirmed with PromptPay — Stripe returns
     // a QR code (PNG/SVG hosted images + raw EMV data) in next_action.
@@ -112,10 +142,10 @@ export async function onRequestPost(context) {
     // row written by this version of the code leaves birthdate untouched
     // at its column default (NULL for a brand-new row).
     await env.DB.prepare(
-      `INSERT INTO payments (phone, name, age_at_purchase, birthplace, charge_id, amount, status)
-       VALUES (?, ?, ?, ?, ?, 5900, 'pending')
-       ON CONFLICT(charge_id) DO UPDATE SET phone=excluded.phone, name=excluded.name, age_at_purchase=excluded.age_at_purchase, birthplace=excluded.birthplace, status='pending'`
-    ).bind(phone, name, age, birthplace, chargeId).run();
+      `INSERT INTO payments (phone, name, age_at_purchase, birthplace, charge_id, amount, status, owner_user_id)
+       VALUES (?, ?, ?, ?, ?, 5900, 'pending', ?)
+       ON CONFLICT(charge_id) DO UPDATE SET phone=excluded.phone, name=excluded.name, age_at_purchase=excluded.age_at_purchase, birthplace=excluded.birthplace, status='pending', owner_user_id=COALESCE(payments.owner_user_id, excluded.owner_user_id)`
+    ).bind(phone, name, age, birthplace, chargeId, ownerUserId).run();
 
     return json({ chargeId, qrCodeUrl, hostedUrl });
 

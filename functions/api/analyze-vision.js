@@ -49,7 +49,7 @@ export async function onRequestPost(context) {
   // or the database being unreachable. In none of those cases do we reach the
   // AI call below. Nothing here changes prices or what an existing paying
   // customer is entitled to.
-  const access = await checkPaidAccess(env, token);
+  const access = await checkPaidAccess(context, token);
   if (!access.ok) return json({ ok: false, error: access.error }, access.status);
 
 

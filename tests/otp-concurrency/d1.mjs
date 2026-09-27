@@ -9,8 +9,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 export function openD1(file) {
   const db = new DatabaseSync(file);
-  db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA busy_timeout = 15000');
+  db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA synchronous = FULL');
 
   const mk = (sql, args) => ({
