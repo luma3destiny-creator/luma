@@ -53,12 +53,10 @@ export async function onRequestPost(context) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ error: 'Invalid payload' }, 400);
   const { email, token } = body;
   // Same owner/session gate as every other paid endpoint (see
-  // functions/lib/paid-access.mjs's header): a bare token is not enough once
-  // its order is linked to a member account -- the caller must be signed in,
-  // right now, as that exact account. This endpoint used to check only the
-  // token, which let a token that had already stopped working everywhere
-  // else still send email. An unlinked (owner_user_id NULL) row is
-  // unaffected, exactly as before.
+  // functions/lib/paid-access.mjs's header): a bare token is never enough on
+  // its own -- the caller must be signed in, right now, as the exact account
+  // the order is bound to. An unlinked (owner_user_id NULL) row is refused
+  // outright, for anyone -- there is no legacy/anonymous send path left.
   const access = await checkPaidAccess(context, token);
   if (!access.ok) return json({ error: access.error }, access.status);
   const order = { id: access.paymentId };

@@ -74,34 +74,41 @@ export async function onRequestPost(context) {
     // from the backfill script's own aggregate counts, not per-request).
   }
 
-  // Owner (if any) comes ONLY from this request's own server-side session --
-  // never from anything in the request body, which has no user_id field for
-  // a client to spoof. A signed-out purchase, or one made while membership is
-  // disabled, simply gets no owner (NULL), exactly as it always has.
+  // LOGIN IS NOW MANDATORY BEFORE PURCHASE. Every entitlement this
+  // checkout creates is bound to a signed-in member account
+  // (LINE/Google) -- there is no more anonymous/unowned purchase path,
+  // and no phone-based recovery to fall back to afterwards. owner_user_id
+  // comes ONLY from this request's own server-side session -- never from
+  // anything in the request body, which has no user_id field for a client
+  // to spoof.
   //
-  // The distinction that matters: no session COOKIE at all is a normal,
-  // expected "not signed in" outcome (true on Production today, and true for
-  // every signed-out visitor here) and proceeds unowned, silently, same as
-  // before. A cookie that IS present but whose lookup throws (a DB error,
-  // not "not signed in") must NOT be treated the same way -- silently
-  // falling through to an unowned order would strand a genuinely signed-in
-  // buyer's purchase as unlinked with no signal that anything went wrong.
-  // That case fails the checkout instead.
-  let ownerUserId = null;
+  // Three ways this can fail to resolve to a real, live member, and all
+  // three refuse the checkout the same way -- before the payment provider
+  // is ever called and before any row is written to `payments`:
+  //   1. No session cookie at all.
+  //   2. A cookie present but its lookup throws (a DB error, not "not
+  //      signed in") -- silently proceeding here would either strand a
+  //      genuinely signed-in buyer's purchase as unlinked, or (now) create
+  //      a purchase this endpoint is no longer allowed to make at all.
+  //   3. A cookie present but it does not resolve to an active session
+  //      (expired/revoked/unknown) -- a normal "not actually signed in"
+  //      outcome, but under this rule it is refused rather than quietly
+  //      downgraded to an ownerless purchase.
   const hasSessionCookie = validToken(readCookie(request, SESSION_COOKIE));
-  if (hasSessionCookie) {
-    let member;
-    try {
-      member = await currentMember(env, request);
-    } catch (e) {
-      console.error('pay: session lookup failed with a session cookie present -- refusing to create an ownerless order:', e);
-      return json({ error: 'ระบบยังไม่พร้อม กรุณาลองใหม่อีกครั้ง' }, 503);
-    }
-    // member === null here means the cookie did not resolve to an active
-    // session (expired/revoked/unknown) -- a normal "not actually signed in"
-    // outcome, not a failure. Proceeds unowned, exactly like no cookie at all.
-    if (member) ownerUserId = member.id;
+  if (!hasSessionCookie) {
+    return json({ error: 'กรุณาเข้าสู่ระบบด้วยบัญชี LINE หรือ Google ก่อนชำระเงิน', code: 'LOGIN_REQUIRED' }, 401);
   }
+  let member;
+  try {
+    member = await currentMember(env, request);
+  } catch (e) {
+    console.error('pay: session lookup failed with a session cookie present -- refusing checkout:', e);
+    return json({ error: 'ระบบยังไม่พร้อม กรุณาลองใหม่อีกครั้ง' }, 503);
+  }
+  if (!member) {
+    return json({ error: 'กรุณาเข้าสู่ระบบด้วยบัญชี LINE หรือ Google ก่อนชำระเงิน', code: 'LOGIN_REQUIRED' }, 401);
+  }
+  const ownerUserId = member.id;
 
   try {
     // Create a Stripe PaymentIntent confirmed with PromptPay — Stripe returns

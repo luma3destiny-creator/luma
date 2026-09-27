@@ -1,104 +1,27 @@
-// functions/api/verify-otp.js — step 2 of recovery: prove ownership, get a token.
+// functions/api/verify-otp.js — RETIRED.
 //
-// A token is issued ONLY after a code that we sent to that number is returned
-// correctly, within its lifetime, within the attempt budget, and unused.
+// Step 2 of phone-based recovery, retired for the same reason as
+// functions/api/request-otp.js: entitlements are bound to signed-in member
+// accounts now, and there is no prior-purchase data this rollout needs to
+// preserve a recovery path for.
 //
-// Consuming the code and writing the new token onto the payment row are two
-// separate writes and the worker can die between them. The token is therefore
-// decided and stored on the challenge in the same statement that consumes the
-// code; if the second write never happened, presenting the same code again
-// finishes the job and returns the SAME token. That is recovery, not a second
-// grant — see consumeChallengeByPublicId.
+// This handler is now an unconditional 410: it never parses `phone`/`code`/
+// `challengeId`, never reads or writes an otp_challenges or payments row,
+// and never issues a token. It does NOT check OTP_PEPPER,
+// PURCHASE_RECOVERY_DISABLED, or any other environment variable -- nothing
+// here reads one, so nothing here can be reopened by a stale or missing
+// env value.
 
-import { hashCode, hashPhone, toE164Thai, toLocalThai,
-         consumeChallengeByPublicId, applyTokenToOrder, abandonIssuedToken,
-         challengePhoneHash } from '../lib/otp.mjs';
+export async function onRequestOptions() {
+  return cors(null, 204);
+}
 
-export async function onRequestOptions() { return cors(null, 204); }
-
-export async function onRequestPost(context) {
-  const { request, env } = context;
-
-  if (!env.DB) return json({ error: 'ระบบไม่พร้อมใช้งานชั่วคราว' }, 503);
-  if (!env.OTP_PEPPER) {
-    console.error('verify-otp: OTP_PEPPER not configured — refusing');
-    return json({ error: 'ระบบไม่พร้อมใช้งานชั่วคราว' }, 503);
-  }
-
-  // Hard kill switch, closed server-side -- see check-access.js.
-  if (env.PURCHASE_RECOVERY_DISABLED === 'true') {
-    return json({ ok: false, error: 'ระบบกู้คืนสิทธิ์ด้วย OTP ปิดใช้งานแล้ว กรุณาเข้าสู่ระบบด้วยบัญชีสมาชิกแทน', code: 'RECOVERY_CLOSED' }, 410);
-  }
-
-  let body;
-  try { body = await request.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
-
-  const e164 = toE164Thai(body && body.phone);
-  const code = typeof (body && body.code) === 'string' ? body.code.trim() : '';
-  const challengeId = typeof (body && body.challengeId) === 'string' ? body.challengeId.trim() : '';
-  if (!e164 || !challengeId || !/^\d{4,8}$/.test(code)) {
-    return json({ ok: false, error: 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว' }, 400);
-  }
-
-  const pepper = env.OTP_PEPPER;
-  const phoneHash = await hashPhone(pepper, e164);
-  const codeHash = await hashCode(pepper, e164, code);
-
-  try {
-    // The challenge must belong to the number being claimed, or a challenge
-    // created for one number could be paired with another number's code.
-    const boundHash = await challengePhoneHash(env, challengeId);
-    if (!boundHash || boundHash !== phoneHash) {
-      return json({ ok: false, error: 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว' }, 401);
-    }
-
-    const result = await consumeChallengeByPublicId(env, {
-      publicId: challengeId,
-      codeHash,
-      candidateToken: crypto.randomUUID(),
-      purpose: 'recovery'
-    });
-    if (!result.ok) {
-      // One message for every failure mode: a caller must not learn whether the
-      // code was wrong, expired, already used, or never existed.
-      console.log('verify-otp: rejected (' + result.reason + ')');
-      return json({ ok: false, error: 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว' }, 401);
-    }
-
-    const local = toLocalThai(e164);
-    // Same fail-closed expiry rule as request-otp.js and every paid API.
-    const row = await env.DB.prepare(
-      `SELECT id, expires_at FROM payments
-        WHERE phone = ? AND status = 'paid' AND datetime(expires_at) > datetime('now')
-        ORDER BY paid_at DESC LIMIT 1`
-    ).bind(local).first();
-
-    // A correct code for a number with no live entitlement. Nothing to hand
-    // over, and the same message as every other rejection.
-    if (!row) {
-      await abandonIssuedToken(env, challengeId);   // stop holding a token we will not use
-      return json({ ok: false, error: 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว' }, 401);
-    }
-
-    // Rotate the token. The write re-checks, in the same statement, that this
-    // challenge is still the newest for the number and has not already been
-    // applied -- so a request that stalled and resumed after the customer
-    // recovered with a newer code writes nothing rather than replacing the
-    // token they are now holding.
-    const applied = await applyTokenToOrder(env, {
-      publicId: challengeId, orderId: row.id, token: result.token
-    });
-    if (!applied.applied) {
-      console.log('verify-otp: refused a token write that is no longer current');
-      return json({ ok: false, error: 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว' }, 401);
-    }
-
-    if (result.replay) console.log('verify-otp: completed a token issue that was interrupted earlier');
-    return json({ ok: true, token: result.token, expiresAt: row.expires_at });
-  } catch (e) {
-    console.error('verify-otp error');
-    return json({ error: 'ระบบไม่พร้อมใช้งานชั่วคราว' }, 503);
-  }
+export async function onRequestPost() {
+  return json({
+    ok: false,
+    error: 'ระบบกู้คืนสิทธิ์ด้วยเบอร์โทร/OTP ปิดใช้งานแล้ว กรุณาเข้าสู่ระบบด้วยบัญชี LINE หรือ Google',
+    code: 'RECOVERY_RETIRED'
+  }, 410);
 }
 
 function json(data, status = 200) {

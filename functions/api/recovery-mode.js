@@ -1,35 +1,25 @@
-// functions/api/recovery-mode.js — which recovery method is live right now.
+// functions/api/recovery-mode.js — RETIRED, reports a fixed 'closed' status.
 //
-// This exists so that the browser and the server can never disagree about it.
-// Turning OTP on is ONE switch, OTP_RECOVERY_ENABLED, and both sides read it:
+// Phone/OTP recovery has been permanently removed (see functions/api/
+// request-otp.js, verify-otp.js, and the phone branch of check-access.js).
+// This endpoint no longer reads PURCHASE_RECOVERY_DISABLED or
+// OTP_RECOVERY_ENABLED to decide what to announce -- there is no live
+// recovery method for either of those flags to describe anymore, so
+// reading them here would just be a second, redundant way for a stale/
+// missing env value to misreport the feature as available. It always
+// answers 'closed', unconditionally.
 //
-//   unset / anything else → 'phone'  : the old phone-only recovery still works
-//                                      (what Production does today), and the
-//                                      OTP endpoints are present but unused.
-//   'true'                → 'otp'    : /api/check-access refuses the phone path
-//                                      outright, and the browser shows the code
-//                                      screen.
-//
-// That makes the switch safe in both directions of deployment order: the new
-// frontend can ship before OTP is configured without stranding anyone, and the
-// moment the switch is flipped the phone-only path is closed IN THE BACKEND —
-// so an old cached page cannot talk its way back into it.
-//
-// If this endpoint cannot be reached at all, the frontend assumes 'otp' and
-// reports the service as unavailable. Failing closed is the only safe default:
-// a network error must never be read as "phone-only is fine".
+// Nothing in the current app.html/member.html calls this endpoint anymore
+// (the recovery UI itself is gone), but it is kept, rather than deleted,
+// as a safe fixed answer for any client -- a cached old page, an external
+// integration -- that still asks.
 
-export async function onRequestGet(context) {
-  const { env } = context;
-  const mode = env.PURCHASE_RECOVERY_DISABLED === 'true' ? 'closed'
-    : env.OTP_RECOVERY_ENABLED === 'true' ? 'otp' : 'phone';
-  return new Response(JSON.stringify({ mode }), {
+export async function onRequestGet() {
+  return new Response(JSON.stringify({ mode: 'closed' }), {
     status: 200,
     headers: {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
-      // Short, so flipping the switch takes effect in about a minute rather
-      // than whenever a cache happens to expire.
       'Cache-Control': 'public, max-age=60'
     }
   });

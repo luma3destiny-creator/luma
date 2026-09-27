@@ -73,9 +73,17 @@ try {
     const res = await verifyOtp({ request: req({ phone, code, challengeId }), env });
     out = { status: res.status, body: await res.json() };
   } else if (op === 'check-access') {
-    const [token] = rest;
+    // Optional 4th arg: a Cookie header value (e.g. "__Host-luma_session=...")
+    // -- check-access.js's token branch now requires a live session matching
+    // the row's owner (see functions/lib/paid-access.mjs's header), so a
+    // caller proving it is signed in as the owner passes its session cookie
+    // here; an unauthenticated caller omits it.
+    const [token, cookie] = rest;
     const res = await checkAccess({
-      request: { url: 'https://example.test/api/check-access?token=' + encodeURIComponent(token) },
+      request: {
+        url: 'https://example.test/api/check-access?token=' + encodeURIComponent(token),
+        headers: { get: (k) => (k === 'Cookie' ? (cookie || '') : null) }
+      },
       env
     });
     out = { status: res.status, body: await res.json() };

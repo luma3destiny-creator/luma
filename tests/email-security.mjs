@@ -10,26 +10,51 @@ const bob = 'member-bob-00000002';
 
 test('email authorization and atomic quota prevent unbounded provider calls', async () => {
   const { DB, raw } = openD1(':memory:');
+  const alice = 'member-quota-alice-01';
   // owner_user_id (migrations/015_payments_owner.sql) must exist here too --
-  // sendmail.js now gates through checkPaidAccess, which always selects it.
-  // Every row below leaves it NULL (unowned), so token-only access keeps
-  // working unchanged for everything this file already covered.
+  // sendmail.js gates through checkPaidAccess, which now ALWAYS requires it
+  // set and requires the caller to be signed in as that exact owner (see
+  // functions/lib/paid-access.mjs's header) -- there is no anonymous/unowned
+  // send path left, so every row below is bound to one real member and
+  // every send() call carries that member's session cookie by default.
   raw.exec(`CREATE TABLE payments(id INTEGER PRIMARY KEY,token TEXT,status TEXT,expires_at TEXT,owner_user_id TEXT);
-    INSERT INTO payments VALUES(1,'valid','paid',datetime('now','+1 day'),NULL);
-    INSERT INTO payments VALUES(2,'expired','paid',datetime('now','-1 day'),NULL);
-    INSERT INTO payments VALUES(3,'pending','pending',datetime('now','+1 day'),NULL);`);
+    INSERT INTO payments VALUES(1,'valid','paid',datetime('now','+1 day'),'${alice}');
+    INSERT INTO payments VALUES(2,'expired','paid',datetime('now','-1 day'),'${alice}');
+    INSERT INTO payments VALUES(3,'pending','pending',datetime('now','+1 day'),'${alice}');
+    INSERT INTO payments VALUES(4,'unowned','paid',datetime('now','+1 day'),NULL);`);
   raw.exec(readFileSync(new URL('../migrations/008_email_send_attempts.sql', import.meta.url), 'utf8'));
+  raw.exec(readFileSync(new URL('../migrations/011_membership_core.sql', import.meta.url), 'utf8'));
+  raw.prepare('INSERT INTO users(id) VALUES (?)').run(alice);
+  const aliceSessionToken = randomToken();
+  const now = nowSeconds();
+  raw.prepare('INSERT INTO member_sessions(token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
+    .run(await sha256Hash(aliceSessionToken), alice, now, now + 3600);
+  const aliceCookie = `${SESSION_COOKIE}=${aliceSessionToken}`;
+
   const original = globalThis.fetch;
   let sends = 0, fails = false;
   globalThis.fetch = async () => { sends++; if (fails) throw new Error('timeout'); return new Response('{}'); };
   const env = { DB, BREVO_API_KEY: 'mock-only' };
-  const send = (token, extra = {}, config = env, cookie = '') => onRequestPost({ env: config, request: new Request('https://local/api/sendmail', { method: 'POST', headers: cookie ? { Cookie: cookie } : {}, body: JSON.stringify({ email: 'test@example.com', sections: [{ label: 'งาน', text: 'test' }], token, ...extra }) }) });
+  const send = (token, extra = {}, config = env, cookie = aliceCookie) => onRequestPost({ env: config, request: new Request('https://local/api/sendmail', { method: 'POST', headers: cookie ? { Cookie: cookie } : {}, body: JSON.stringify({ email: 'test@example.com', sections: [{ label: 'งาน', text: 'test' }], token, ...extra }) }) });
   try {
     for (const token of [undefined, 'dev', 'dev-token', 'invalid', 'expired', 'pending']) assert.ok((await send(token)).status >= 400);
     // A missing/placeholder token is now the same "no valid entitlement"
     // rejection checkPaidAccess gives everywhere else (402), not the
     // endpoint's own ad hoc 401.
     assert.equal((await send(undefined, { chargeId: 'pi_known' })).status, 402);
+    assert.equal(sends, 0);
+    // Without any session at all, even a genuinely valid, owned token is
+    // refused before the payment provider is ever touched -- no more
+    // anonymous access. Same for an owned row with the WRONG account
+    // signed in, and for an unowned (NULL) row signed in as anyone.
+    assert.equal((await send('valid', {}, env, '')).status, 401);
+    const bob = 'member-quota-bob-01';
+    raw.prepare('INSERT INTO users(id) VALUES (?)').run(bob);
+    const bobSessionToken = randomToken();
+    raw.prepare('INSERT INTO member_sessions(token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
+      .run(await sha256Hash(bobSessionToken), bob, now, now + 3600);
+    assert.equal((await send('valid', {}, env, `${SESSION_COOKIE}=${bobSessionToken}`)).status, 401);
+    assert.equal((await send('unowned')).status, 401);
     assert.equal(sends, 0);
     const burst = await Promise.all(Array.from({ length: 10 }, () => send('valid')));
     assert.equal(burst.filter(r => r.status === 200).length, 1);
@@ -128,16 +153,25 @@ test('sendmail: bob signed in can never send email with alice\'s owner-bound tok
   assert.equal(signedOut.status, 401, 'signed out entirely, an owner-bound token must not work either');
 });
 
-test('sendmail: an unlinked (owner_user_id NULL) token keeps sending with no session at all', async t => {
+test('sendmail: an unlinked (owner_user_id NULL) token is refused outright -- no anonymous/legacy access, signed out or in as anyone', async t => {
   const { DB, raw } = fixtureWithMembers(t);
   raw.prepare(`INSERT INTO payments(id, token, status, expires_at, owner_user_id) VALUES (1, 'tok-legacy', 'paid', datetime('now','+1 day'), NULL)`).run();
   const env = { DB, BREVO_API_KEY: 'mock-only' };
   const original = globalThis.fetch;
-  globalThis.fetch = async () => new Response('{}');
+  let sends = 0;
+  globalThis.fetch = async () => { sends++; return new Response('{}'); };
+  const send = (cookie) => onRequestPost({ env, request: new Request('https://local/api/sendmail', {
+    method: 'POST', headers: cookie ? { Cookie: cookie } : {},
+    body: JSON.stringify({ email: 'test@example.com', sections: [{ label: 'งาน', text: 'test' }], token: 'tok-legacy' })
+  }) });
   try {
-    const result = await onRequestPost({ env, request: new Request('https://local/api/sendmail', {
-      method: 'POST', body: JSON.stringify({ email: 'test@example.com', sections: [{ label: 'งาน', text: 'test' }], token: 'tok-legacy' })
-    }) });
-    assert.equal(result.status, 200);
+    const signedOut = await send();
+    assert.equal(signedOut.status, 401, 'an unowned row must never be usable signed-out -- there is no legacy customer to protect here');
+
+    const aliceToken = await signIn(raw, alice);
+    const signedInAsAlice = await send(cookieOf(aliceToken));
+    assert.equal(signedInAsAlice.status, 401, 'an unowned row belongs to nobody -- being signed in as SOME account must not grant it either');
+
+    assert.equal(sends, 0, 'the payment provider/email must never be reached for a refused send');
   } finally { globalThis.fetch = original; }
 });

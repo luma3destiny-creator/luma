@@ -1,14 +1,32 @@
 // Concurrency tests against a REAL SQLite database, with REAL parallel OS
 // processes — not a mock that serialises the calls itself.
 //
-// Each case spawns N `conc/worker.mjs` processes that open the same database
-// file and fire at the same moment. What is being tested is whether the SQL in
-// functions/lib/otp.mjs holds its limits when the writers genuinely collide.
+// This file used to also exercise phone/OTP recovery's own crash-safety and
+// throttling logic under concurrency, through the real request-otp.js/
+// verify-otp.js/check-access.js?phone= handlers. That feature has been
+// permanently retired (see functions/api/request-otp.js, verify-otp.js, and
+// the phone branch of check-access.js — all unconditional 410s now, with no
+// prior-purchase data behind this rollout that still needed it). What is
+// left to prove under real concurrency is:
 //
-// Scope, stated plainly: this exercises SQLite's own write serialisation on one
-// file. Cloudflare D1 is SQLite and documents that it serialises writes, but
-// this run does not measure D1 itself. It also does not send any SMS: the mock
-// provider is used throughout.
+//   1. the retirement itself holds under a burst of simultaneous callers —
+//      every request/verify call answers 410, and NOTHING is ever written
+//      to otp_challenges or otp_test_outbox, however many arrive at once or
+//      whatever legacy env flags are set;
+//   2. the check-access token branch — unaffected by the phone-path
+//      retirement, but now REQUIRING a live session that matches the row's
+//      owner (see functions/lib/paid-access.mjs's header) — is consistently
+//      right under a burst: the real owner is let in every time, and an
+//      unauthenticated burst against the same token is refused every time.
+//
+// The Stripe webhook idempotency/retry-safety concurrency tests that used to
+// live in this same file are unrelated to any of this and have moved to
+// tests/otp-concurrency/test_webhook_concurrency.mjs so they keep running on
+// their own, unaffected by this retirement.
+//
+// Scope, stated plainly: this exercises SQLite's own write serialisation on
+// one file. Cloudflare D1 is SQLite and documents that it serialises writes,
+// but this run does not measure D1 itself. It also never sends any SMS.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
@@ -16,6 +34,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { openD1 } from './d1.mjs';
+import { randomToken, hash as sha256Hash, nowSeconds, SESSION_COOKIE } from '../../functions/lib/member-session.mjs';
 
 const run = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -36,20 +55,15 @@ function freshDb(paidPhones) {
   }
   const { raw } = openD1(DBFILE);
   raw.exec(fs.readFileSync(path.join(HERE, 'schema.sql'), 'utf8'));
-  raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '004_webhook_events.sql'), 'utf8'));
-  raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '007_webhook_unresolved.sql'), 'utf8'));
   raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '005_otp_challenges.sql'), 'utf8'));
   raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '006_preview_test_outbox.sql'), 'utf8'));
-  // check-access.js/paid-access.mjs now unconditionally SELECT
-  // payments.owner_user_id on every request -- without this migration that
-  // query fails outright (column does not exist), which is what the two
-  // "existing token holder is let in" cases were hitting.
+  // check-access.js/paid-access.mjs unconditionally SELECT payments.owner_user_id
+  // on every request, and now REQUIRE it set (no more unowned/anonymous access
+  // — see functions/lib/paid-access.mjs's header) — without this migration
+  // that query fails outright (column does not exist).
   raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '015_payments_owner.sql'), 'utf8'));
-  // otp.mjs's reserveRequestSlot/consumeChallengeByPublicId now write and read
-  // purpose/user_id/payment_id on every row, recovery included (purpose
-  // defaults to 'recovery') -- without this migration the INSERT in
-  // reserveRequestSlot fails outright because the columns do not exist.
   raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '016_otp_challenges_purpose.sql'), 'utf8'));
+  raw.exec(fs.readFileSync(path.join(HERE, '..', '..', 'migrations', '011_membership_core.sql'), 'utf8'));
   for (const p of paidPhones) {
     raw.prepare(
       `INSERT INTO payments (phone, charge_id, amount, status, token, paid_at, expires_at)
@@ -57,56 +71,6 @@ function freshDb(paidPhones) {
     ).run(p, 'ch_' + p, 'old-token-' + p);
   }
   raw.close();
-}
-
-
-// Move every challenge's created_at back, so the 60s cooldown and the hourly
-// counters behave as if that much time had passed. expires_at is deliberately
-// NOT moved: the point of these cases is an OLD code that is still inside its
-// 5-minute lifetime and must be refused anyway, because a newer one exists.
-function ageChallenges(seconds) {
-  const { raw } = openD1(DBFILE);
-  try {
-    raw.prepare(`UPDATE otp_challenges SET created_at = datetime(created_at, '-${seconds} seconds')`).run();
-  } finally { raw.close(); }
-}
-
-// A PENDING order, the state /api/pay leaves behind before the customer has
-// paid. Fixture data in a throwaway temp database — nothing here is ever run
-// against Preview or Production, and no row is ever hand-marked paid: the
-// webhook under test is what does that.
-function seedPendingOrder(chargeId, phone = '0900000000', amount = 5900) {
-  const { raw } = openD1(DBFILE);
-  try {
-    raw.prepare(
-      `INSERT INTO payments (phone, charge_id, amount, status, created_at)
-       VALUES (?, ?, ?, 'pending', datetime('now'))`
-    ).run(phone, chargeId, amount);
-  } finally { raw.close(); }
-}
-
-function orderRow(chargeId) {
-  return read((raw) => raw.prepare(
-    `SELECT status, token, paid_at, expires_at FROM payments WHERE charge_id = ?`
-  ).get(chargeId));
-}
-
-function unresolvedRows() {
-  return read((raw) => raw.prepare(
-    `SELECT event_id, reason, attempts, payload, resolved_at FROM webhook_unresolved`).all());
-}
-
-function eventRows() {
-  return read((raw) => raw.prepare(`SELECT event_id FROM webhook_events`).all());
-}
-
-// A run that died is only distinguishable from a sibling still in flight by how
-// long ago it accepted the code, so the crash cases have to look their age.
-function ageConsumed(seconds) {
-  const { raw } = openD1(DBFILE);
-  try {
-    raw.prepare(`UPDATE otp_challenges SET consumed_at = datetime(consumed_at, '-${seconds} seconds') WHERE consumed_at IS NOT NULL`).run();
-  } finally { raw.close(); }
 }
 
 function read(fn) {
@@ -131,640 +95,80 @@ async function burst(specs, env = {}) {
   return results;
 }
 
-const TEST_ENV = { OTP_TEST_OUTBOX: 'true', OTP_TEST_PHONES: '' };
-
-function codeFor(phone) {
-  return read((raw) => {
-    const r = raw.prepare(
-      `SELECT code FROM otp_test_outbox WHERE phone = ? ORDER BY id DESC LIMIT 1`
-    ).get(String(phone).replace(/\D/g, ''));
-    return r ? r.code : null;
-  });
+function challengeCount() {
+  return read((raw) => raw.prepare(`SELECT COUNT(*) AS n FROM otp_challenges`).get()).n;
+}
+function outboxCount() {
+  return read((raw) => raw.prepare(`SELECT COUNT(*) AS n FROM otp_test_outbox`).get()).n;
 }
 
 console.log('\n--- real SQLite, real parallel processes, mock SMS -------------------\n');
 
-// ── 1. the daily SMS cap holds under a burst ────────────────────────────────
+// ── 1. request-otp.js stays a hard 410 under a burst, whatever the env ─────
 {
   const phones = Array.from({ length: 10 }, (_, i) => '08000000' + String(10 + i));
   freshDb(phones);
-  await burst(phones.map((p, i) => ['request', p, '10.0.0.' + i]), { CAP: '3' });
-
-  const rows = read((raw) => raw.prepare(
-    `SELECT COUNT(*) AS total,
-            SUM(CASE WHEN sms_reserved=1 THEN 1 ELSE 0 END) AS reserved,
-            SUM(CASE WHEN send_status='sent' THEN 1 ELSE 0 END) AS sent
-       FROM otp_challenges`).get());
-  check('10 simultaneous requests, cap 3 → exactly 3 SMS slots reserved',
-        Number(rows.reserved) === 3, 'reserved=' + rows.reserved);
-  check('10 simultaneous requests, cap 3 → exactly 3 messages sent',
-        Number(rows.sent) === 3, 'sent=' + rows.sent);
-  check('a request row is written for every caller, not only the winners',
-        Number(rows.total) === 10, 'rows=' + rows.total);
+  const legacyEnvs = [
+    {},
+    { OTP_TEST_OUTBOX: 'true', OTP_TEST_PHONES: '' },
+    { PURCHASE_RECOVERY_DISABLED: 'false' },
+    { OTP_RECOVERY_ENABLED: 'true' }
+  ];
+  for (const extraEnv of legacyEnvs) {
+    const results = await burst(phones.map((p, i) => ['request', p, '10.0.0.' + i]), extraEnv);
+    check('10 simultaneous request-otp calls all answer 410 (env=' + JSON.stringify(extraEnv) + ')',
+          results.every(r => r.status === 410 && r.body && r.body.code === 'RECOVERY_RETIRED'),
+          JSON.stringify(results.map(r => r.status)));
+  }
+  check('after every burst above, otp_challenges is still empty', Number(challengeCount()) === 0, 'rows=' + challengeCount());
+  check('…and otp_test_outbox is still empty (no SMS was ever queued)', Number(outboxCount()) === 0, 'rows=' + outboxCount());
 }
 
-// ── 2. non-customers cannot drain the SMS budget ────────────────────────────
-{
-  const paid = ['0800000099'];
-  freshDb(paid);
-  const strangers = Array.from({ length: 8 }, (_, i) => '08999999' + String(10 + i));
-  await burst(strangers.map((p, i) => ['request', p, '10.1.0.' + i]), { CAP: '3' });
-  const after = read((raw) => raw.prepare(
-    `SELECT COUNT(*) AS total, SUM(sms_reserved) AS reserved FROM otp_challenges`).get());
-  check('8 requests for numbers that never paid reserve 0 SMS slots',
-        Number(after.reserved || 0) === 0, 'reserved=' + after.reserved);
-  check('…but each still leaves a throttle row, so the cooldown behaves the same',
-        Number(after.total) === 8, 'rows=' + after.total);
-
-  // the customer can still get a code afterwards: the budget was not touched
-  await burst([['request', paid[0], '10.1.0.99']], { CAP: '3' });
-  const cust = read((raw) => raw.prepare(
-    `SELECT SUM(sms_reserved) AS reserved FROM otp_challenges`).get());
-  check('a real customer can still be served after the stranger burst',
-        Number(cust.reserved) === 1, 'reserved=' + cust.reserved);
-}
-
-// ── 3. one number, many simultaneous requests → one challenge ───────────────
+// ── 2. verify-otp.js stays a hard 410 under a burst, and rotates nothing ───
 {
   const phone = '0811111111';
   freshDb([phone]);
-  await burst(Array.from({ length: 8 }, (_, i) => ['request', phone, '10.2.0.' + i]), { CAP: '20' });
-  const n = read((raw) => raw.prepare(`SELECT COUNT(*) AS n FROM otp_challenges`).get()).n;
-  check('8 simultaneous requests for one number → at most 1 challenge (cooldown)',
-        Number(n) === 1, 'challenges=' + n);
+  const results = await burst(
+    Array.from({ length: 10 }, () => ['verify', phone, '123456', 'not-a-real-challenge-id']),
+    {}
+  );
+  check('10 simultaneous verify-otp calls all answer 410',
+        results.every(r => r.status === 410 && r.body && r.body.code === 'RECOVERY_RETIRED'),
+        JSON.stringify(results.map(r => r.status)));
+  check('the pre-existing payment token was never touched by any of them',
+        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token === 'old-token-' + phone);
+  check('otp_challenges is still empty', Number(challengeCount()) === 0, 'rows=' + challengeCount());
 }
 
-// ── 4. a code can be redeemed exactly once ──────────────────────────────────
+// ── 3. check-access token branch: the real owner is let in, consistently,
+//      under a concurrent burst; an unauthenticated burst against the exact
+//      same token is refused every single time ───────────────────────────
 {
   const phone = '0822222222';
+  const owner = 'member-conc-alice-01';
   freshDb([phone]);
-  await burst([['request', phone, '10.3.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: '66822222222' });
-  const code = codeFor('66822222222');
-  const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges LIMIT 1`).get()).public_id;
-  check('the test outbox captured a code for the listed internal number', !!code);
-
-  const res = await burst(Array.from({ length: 6 }, () => ['verify', phone, code, pub]), { CAP: '20' });
-  const wins = res.filter(r => r.body && r.body.ok && r.body.token);
-  const tokens = new Set(wins.map(r => r.body.token));
-  // A pending replay may finish the same interrupted issuance concurrently.
-  // Multiple successful responses must all carry the one stored token.
-  check('6 simultaneous redemptions of one code → at least 1 success',
-        wins.length >= 1, 'successes=' + wins.length);
-  check('…and exactly 1 distinct token was issued', tokens.size === 1, 'tokens=' + tokens.size);
-  const stored = read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token;
-  check('the stored token is the one that was handed out',
-        wins.length >= 1 && wins.every(r => stored === r.body.token));
-  check('the losers all got the same generic rejection',
-        res.filter(r => r.status === 401).length === res.length - wins.length,
-        '401s=' + res.filter(r => r.status === 401).length);
-}
-
-// ── 5. wrong guesses stop exactly at the attempt limit ──────────────────────
-{
-  const phone = '0833333333';
-  freshDb([phone]);
-  await burst([['request', phone, '10.4.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: '66833333333' });
-  const realCode = codeFor('66833333333');
-  const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges LIMIT 1`).get()).public_id;
-
-  const wrong = String((Number(realCode) + 1) % 1000000).padStart(6, '0');
-  await burst(Array.from({ length: 20 }, () => ['verify', phone, wrong, pub]), { CAP: '20' });
-  const att = read((raw) => raw.prepare(`SELECT attempts FROM otp_challenges LIMIT 1`).get()).attempts;
-  check('20 simultaneous wrong guesses consume at most 5 attempts',
-        Number(att) <= 5, 'attempts=' + att);
-
-  const late = await burst([['verify', phone, realCode, pub]], { CAP: '20' });
-  check('after the attempt budget is spent, even the real code is refused',
-        late[0].status === 401, 'status=' + late[0].status);
-  const tok = read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token;
-  check('…and the customer token was never rotated', tok === 'old-token-' + phone);
-}
-
-// ── 6. a crash between "code accepted" and "token written" ──────────────────
-{
-  const phone = '0844444444';
-  freshDb([phone]);
-  await burst([['request', phone, '10.5.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: '66844444444' });
-  const code = codeFor('66844444444');
-  const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges LIMIT 1`).get()).public_id;
-
-  const crashed = await burst([['verify-crash', phone, code, pub]], { CAP: '20' });
-  ageConsumed(30);
-  check('the interrupted run did accept the code', !!(crashed[0].crashedAfter && crashed[0].crashedAfter.ok));
-  const mid = read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token;
-  check('after the crash the payment row still holds the OLD token',
-        mid === 'old-token-' + phone, 'token=' + mid);
-
-  const retry = await burst([['verify', phone, code, pub]], { CAP: '20' });
-  check('retrying the same code after a crash succeeds instead of burning it',
-        retry[0].status === 200 && retry[0].body.ok, 'status=' + retry[0].status);
-  check('…and returns the token the interrupted run had already reserved',
-        retry[0].body && retry[0].body.token === 'tok-from-crashed-run',
-        'token=' + (retry[0].body && retry[0].body.token));
-  const end = read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token;
-  check('…and the payment row now holds exactly that token',
-        end === 'tok-from-crashed-run', 'token=' + end);
-
-  const again = await burst([['verify', phone, code, pub]], { CAP: '20' });
-  check('a third use of the same code is refused (recovery is not a reissue)',
-        again[0].status === 401, 'status=' + again[0].status);
-}
-
-// ── 7. a customer's number and a stranger's number look identical ───────────
-{
-  const customer = '0855555555', stranger = '0866666666';
-  freshDb([customer]);
-  const first = await burst([['request', customer, '10.6.0.1'], ['request', stranger, '10.6.0.2']], { CAP: '20' });
-  const [c1, s1] = first;
-  check('same HTTP status for a customer and a stranger',
-        c1.status === s1.status && c1.status === 200, c1.status + ' vs ' + s1.status);
-  check('same response keys',
-        JSON.stringify(Object.keys(c1.body).sort()) === JSON.stringify(Object.keys(s1.body).sort()),
-        JSON.stringify(Object.keys(c1.body)) + ' vs ' + JSON.stringify(Object.keys(s1.body)));
-  check('same message text', c1.body.message === s1.body.message);
-  check('both got a challengeId of the same shape',
-        /^[0-9a-f-]{36}$/.test(c1.body.challengeId) && /^[0-9a-f-]{36}$/.test(s1.body.challengeId));
-  check('the two challengeIds differ', c1.body.challengeId !== s1.body.challengeId);
-
-  // the cooldown is the tell that mattered: ask both again straight away
-  const second = await burst([['request', customer, '10.6.0.1'], ['request', stranger, '10.6.0.2']], { CAP: '20' });
-  const rows = read((raw) => raw.prepare(
-    `SELECT phone_hash, COUNT(*) AS n FROM otp_challenges GROUP BY phone_hash`).all());
-  check('a repeat within the cooldown creates no second row — for EITHER number',
-        rows.length === 2 && rows.every(r => Number(r.n) === 1),
-        JSON.stringify(rows.map(r => r.n)));
-  check('and the repeat still answers 200 with the same shape, for both',
-        second.every(r => r.status === 200 && r.body.message === c1.body.message));
-}
-
-// ── 8. the test outbox stays shut unless all three gates are open ───────────
-{
-  const phone = '0877777777';
-  freshDb([phone]);
-  await burst([['request', phone, '10.7.0.1']], { CAP: '20' });                       // no gates
-  await burst([['request', '0877777778', '10.7.0.2']],
-              { CAP: '20', OTP_TEST_OUTBOX: 'true', OTP_TEST_PHONES: '66877777777' }); // not listed
-  const n = read((raw) => raw.prepare(`SELECT COUNT(*) AS n FROM otp_test_outbox`).get()).n;
-  check('nothing reaches the test outbox without OTP_TEST_OUTBOX and a listed number',
-        Number(n) === 0, 'rows=' + n);
-}
-
-// ── 9. no response, and no log line, ever carries the code ─────────────────
-{
-  const phone = '0888888888';
-  freshDb([phone]);
-  const out = await run(process.execPath,
-    [path.join(HERE, 'worker-loud.mjs'), DBFILE, 'request', phone, '10.8.0.1'],
-    { env: { ...process.env, CAP: '20', OTP_TEST_OUTBOX: 'true', OTP_TEST_PHONES: '66888888888' } });
-  const code = codeFor('66888888888');
-  check('a code was issued for this run', !!code);
-  check('the code does not appear in the API response body',
-        !out.stdout.includes(code), 'stdout');
-  check('the code does not appear in anything the worker logged',
-        !out.stderr.includes(code) && !out.stdout.includes(code));
-}
-
-
-// ── 10. a failed send must not let anyone in ───────────────────────────────
-{
-  const phone = '0899999991';
-  freshDb([phone]);
-  // brevo selected with no API key: refused before any request leaves.
-  await burst([['request', phone, '10.9.0.1']], { CAP: '20', SMS_PROVIDER: 'brevo' });
-  const row = read((raw) => raw.prepare(
-    `SELECT public_id, send_status, send_error, sms_reserved FROM otp_challenges LIMIT 1`).get());
-  check('a refused send is recorded as failed, not sent',
-        row.send_status === 'failed', 'status=' + row.send_status);
-  const tok = read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token;
-  check('a refused send issues no entitlement', tok === 'old-token-' + phone);
-  const guess = await burst([['verify', phone, '123456', row.public_id]], { CAP: '20' });
-  check('…and no code can be guessed into working', guess[0].status === 401);
-  check('…and no fallback ever accepts the phone number alone',
-        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token
-          === 'old-token-' + phone);
-}
-
-// ── 11. no reply from the provider is 'unknown', not 'failed' ──────────────
-{
-  const phone = '0899999992';
-  freshDb([phone]);
-  await burst([['request', phone, '10.10.0.1']],
-              { CAP: '20', SMS_PROVIDER: 'brevo', BREVO_API_KEY: 'k', SMS_SENDER_ID: 'LUMA',
-                SIMULATE_TIMEOUT: 'true' });
-  const row = read((raw) => raw.prepare(
-    `SELECT send_status, sms_reserved FROM otp_challenges LIMIT 1`).get());
-  check('a send with no reply is recorded as unknown — it may still be billed',
-        row.send_status === 'unknown', 'status=' + row.send_status);
-  check('…and it still counted against the SMS budget, because it may have been sent',
-        Number(row.sms_reserved) === 1);
-}
-
-// ── 12. a challenge is bound to the number it was created for ──────────────
-{
-  const a = '0899999993', b = '0899999994';
-  freshDb([a, b]);
-  await burst([['request', a, '10.11.0.1']],
-              { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: '66899999993' });
-  const code = codeFor('66899999993');
-  const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges LIMIT 1`).get()).public_id;
-  const cross = await burst([['verify', b, code, pub]], { CAP: '20' });
-  check("another number cannot redeem this number's challenge",
-        cross[0].status === 401, 'status=' + cross[0].status);
-  check("…and that number's token was not touched",
-        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(b)).token
-          === 'old-token-' + b);
-}
-
-// ── 13. customers already holding a token are unaffected throughout ─────────
-{
-  const phone = '0899999995';
-  freshDb([phone]);
-  const before = await burst([['check-access', 'old-token-' + phone]]);
-  check('an existing token holder is let in before any OTP activity',
-        before[0].body && before[0].body.ok === true, JSON.stringify(before[0].body));
-
-  await burst([['request', phone, '10.12.0.1']], { CAP: '20' });
-  const after = await burst([['check-access', 'old-token-' + phone]]);
-  check('…and still let in after a code has been requested',
-        after[0].body && after[0].body.ok === true, JSON.stringify(after[0].body));
-
-  const stranger = await burst([['check-access', 'not-a-real-token']]);
-  check('a token nobody was issued is refused',
-        !(stranger[0].body && stranger[0].body.ok), JSON.stringify(stranger[0].body));
-}
-
-
-// ── 14. asking for a new code retires the old one ──────────────────────────
-// The bug this closes: request A, wait out the cooldown, request B -- and A's
-// code still opened the account. Two live codes for one number is one code too
-// many.
-{
-  const phone = '0866000001';
-  freshDb([phone]);
-  const E164 = '66866000001';
-  await burst([['request', phone, '10.14.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const codeA = codeFor(E164);
-  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-
-  ageChallenges(70);   // past the cooldown
-  await burst([['request', phone, '10.14.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const codeB = codeFor(E164);
-  const pubB = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-  check('the resend produced a different code and challenge',
-        codeA !== codeB && pubA !== pubB);
-
-  const oldTry = await burst([['verify', phone, codeA, pubA]], { CAP: '20' });
-  check('the OLD code is refused once a new one has been sent',
-        oldTry[0].status === 401, 'status=' + oldTry[0].status);
-  check('…and the old attempt rotated nothing',
-        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token
-          === 'old-token-' + phone);
-  check('…and it did not even spend an attempt on the retired challenge',
-        Number(read((raw) => raw.prepare(`SELECT attempts FROM otp_challenges WHERE public_id=?`).get(pubA)).attempts) === 0);
-
-  const newTry = await burst([['verify', phone, codeB, pubB]], { CAP: '20' });
-  check('the NEW code still works', newTry[0].status === 200 && newTry[0].body.ok);
-}
-
-// ── 15. a resend the provider REFUSED must not retire the working code ─────
-{
-  const phone = '0866000002';
-  freshDb([phone]);
-  const E164 = '66866000002';
-  await burst([['request', phone, '10.15.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const codeA = codeFor(E164);
-  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-
-  ageChallenges(70);
-  // brevo with no API key: refused before anything leaves. Nothing was delivered,
-  // so the customer is still holding codeA and must not be stranded.
-  await burst([['request', phone, '10.15.0.1']], { CAP: '20', SMS_PROVIDER: 'brevo' });
-  check('the failed resend is recorded as failed',
-        read((raw) => raw.prepare(`SELECT send_status FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).send_status === 'failed');
-
-  const stillWorks = await burst([['verify', phone, codeA, pubA]], { CAP: '20' });
-  check('a resend that never went out does NOT retire the code in hand',
-        stillWorks[0].status === 200 && stillWorks[0].body.ok, 'status=' + stillWorks[0].status);
-}
-
-// ── 16. a resend with no reply DOES retire the old code ───────────────────
-// 'unknown' means it may well have been delivered. Leaving the old one alive on
-// that guess is the same two-live-codes bug, so the safe reading wins.
-{
-  const phone = '0866000003';
-  freshDb([phone]);
-  const E164 = '66866000003';
-  await burst([['request', phone, '10.16.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const codeA = codeFor(E164);
-  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-
-  ageChallenges(70);
-  await burst([['request', phone, '10.16.0.1']],
-              { CAP: '20', SMS_PROVIDER: 'brevo', BREVO_API_KEY: 'k', SMS_SENDER_ID: 'LUMA', SIMULATE_TIMEOUT: 'true' });
-  check('the no-reply resend is recorded as unknown',
-        read((raw) => raw.prepare(`SELECT send_status FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).send_status === 'unknown');
-
-  const oldTry = await burst([['verify', phone, codeA, pubA]], { CAP: '20' });
-  check('a resend that may have gone out DOES retire the old code',
-        oldTry[0].status === 401, 'status=' + oldTry[0].status);
-}
-
-// ── 17. retiring survives simultaneous attempts ───────────────────────────
-{
-  const phone = '0866000004';
-  freshDb([phone]);
-  const E164 = '66866000004';
-  await burst([['request', phone, '10.17.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const codeA = codeFor(E164);
-  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-  ageChallenges(70);
-  await burst([['request', phone, '10.17.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const codeB = codeFor(E164);
-  const pubB = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-
-  const olds = await burst(Array.from({ length: 6 }, () => ['verify', phone, codeA, pubA]), { CAP: '20' });
-  check('6 simultaneous attempts with the retired code all fail',
-        olds.every(r => r.status === 401), JSON.stringify(olds.map(r => r.status)));
-
-  const news = await burst(Array.from({ length: 6 }, () => ['verify', phone, codeB, pubB]), { CAP: '20' });
-  const wins = news.filter(r => r.body && r.body.ok && r.body.token);
-  const distinct = new Set(wins.map(r => r.body.token));
-  check('6 simultaneous attempts with the live code yield at most ONE token value',
-        wins.length >= 1 && distinct.size === 1,
-        'successes=' + wins.length + ' distinct=' + distinct.size);
-  check('…and the payment row holds exactly that token',
-        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token
-          === wins[0].body.token);
-}
-
-// ── 18. an interrupted issue still completes when nothing newer exists ─────
-{
-  const phone = '0866000005';
-  freshDb([phone]);
-  const E164 = '66866000005';
-  await burst([['request', phone, '10.18.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const code = codeFor(E164);
-  const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-
-  await burst([['verify-crash', phone, code, pub]], { CAP: '20' });
-  ageConsumed(30);
-  const retry = await burst([['verify', phone, code, pub]], { CAP: '20' });
-  check('crash recovery still works when no newer code was sent',
-        retry[0].status === 200 && retry[0].body.token === 'tok-from-crashed-run',
-        'status=' + retry[0].status);
-}
-
-// ── 19. an interrupted issue cannot overwrite a newer token ───────────────
-// The dangerous shape: the customer gives up on the interrupted code, asks for
-// a new one, succeeds -- and then the stale reserved token gets applied on top,
-// silently logging them out.
-{
-  const phone = '0866000006';
-  freshDb([phone]);
-  const E164 = '66866000006';
-  await burst([['request', phone, '10.19.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const codeA = codeFor(E164);
-  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-  await burst([['verify-crash', phone, codeA, pubA]], { CAP: '20' });
-  ageConsumed(30);
-
-  ageChallenges(70);
-  await burst([['request', phone, '10.19.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const codeB = codeFor(E164);
-  const pubB = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-  const good = await burst([['verify', phone, codeB, pubB]], { CAP: '20' });
-  check('the new code issues a token normally', good[0].status === 200 && good[0].body.ok);
-  const current = read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token;
-
-  const stale = await burst([['verify', phone, codeA, pubA]], { CAP: '20' });
-  check('the interrupted older code is refused afterwards',
-        stale[0].status === 401, 'status=' + stale[0].status);
-  check('…and the newer token was NOT overwritten',
-        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token === current);
-  check('…and no second token was handed out', !(stale[0].body && stale[0].body.token));
-}
-
-// ── 20. expiry is unchanged by any of this ────────────────────────────────
-{
-  const phone = '0866000007';
-  freshDb([phone]);
-  const before = read((raw) => raw.prepare(`SELECT expires_at FROM payments WHERE phone=?`).get(phone)).expires_at;
-  const E164 = '66866000007';
-  await burst([['request', phone, '10.20.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const code = codeFor(E164);
-  const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-  await burst([['verify', phone, code, pub]], { CAP: '20' });
-  check('recovering access never moves the entitlement expiry date',
-        read((raw) => raw.prepare(`SELECT expires_at FROM payments WHERE phone=?`).get(phone)).expires_at === before);
-}
-
-
-// ════ Stripe webhook: a retry must be able to finish what a failure started ══
-//
-// The bug: the event was recorded on ARRIVAL and the work done afterwards. When
-// the work failed, the first delivery answered 500, Stripe retried, and the
-// retry found the row already there and answered "duplicate ignored" — while
-// the payment sat pending with no token. A paid customer, silently given
-// nothing, with the books saying the event was handled.
-
-// ── 21. a failure before granting must leave the event retryable ───────────
-{
-  freshDb([]);
-  const CH = 'pi_wh_retry';
-  seedPendingOrder(CH);
-
-  const first = await burst([['webhook', CH, 'evt_retry_1']], { FAIL_AT: 'grant' });
-  check('a database failure while granting answers 500 so Stripe retries',
-        first[0].status === 500, 'status=' + first[0].status);
-  check('…the order is still pending', orderRow(CH).status === 'pending');
-  check('…and NOTHING was recorded, so the event is not marked handled',
-        eventRows().length === 0, 'events=' + eventRows().length);
-
-  const retry = await burst([['webhook', CH, 'evt_retry_1']]);
-  check('the retry of the same event actually grants (not "duplicate ignored")',
-        retry[0].status === 200 && retry[0].body === 'ok',
-        'status=' + retry[0].status + ' body=' + retry[0].body);
-  const row = orderRow(CH);
-  check('…the order is now paid', row.status === 'paid');
-  check('…and it has a token', !!row.token);
-  check('…and the event is recorded only now', eventRows().length === 1);
-}
-
-// ── 22. a failure AFTER granting, before recording, still completes ────────
-{
-  freshDb([]);
-  const CH = 'pi_wh_after';
-  seedPendingOrder(CH);
-
-  const first = await burst([['webhook', CH, 'evt_after_1']], { FAIL_AT: 'record_event' });
-  check('dying after the grant answers 500', first[0].status === 500, 'status=' + first[0].status);
-  const mid = orderRow(CH);
-  check('…the entitlement was granted anyway', mid.status === 'paid' && !!mid.token);
-  check('…but the event is not recorded', eventRows().length === 0);
-
-  const retry = await burst([['webhook', CH, 'evt_after_1']]);
-  check('the retry completes without granting a second time',
-        retry[0].status === 200, 'status=' + retry[0].status);
-  const after = orderRow(CH);
-  check('…the token is unchanged', after.token === mid.token);
-  check('…the paid_at is unchanged', after.paid_at === mid.paid_at);
-  check('…and the expiry date was not moved', after.expires_at === mid.expires_at);
-  check('…and the event is recorded once', eventRows().length === 1);
-}
-
-// ── 23. simultaneous deliveries grant exactly once ────────────────────────
-{
-  freshDb([]);
-  const CH = 'pi_wh_race';
-  seedPendingOrder(CH);
-
-  const all = await burst(Array.from({ length: 6 }, () => ['webhook', CH, 'evt_race_1']));
-  check('6 simultaneous deliveries of one event all answer 200',
-        all.every(r => r.status === 200), JSON.stringify(all.map(r => r.status)));
-  const row = orderRow(CH);
-  check('…the order is paid exactly once, with one token', row.status === 'paid' && !!row.token);
-  check('…and only one event row exists', eventRows().length === 1);
-  check('…and no response leaked a token',
-        all.every(r => !String(r.body).includes(row.token)));
-}
-
-// ── 24. a replay after success is cheap and changes nothing ───────────────
-{
-  freshDb([]);
-  const CH = 'pi_wh_replay';
-  seedPendingOrder(CH);
-  await burst([['webhook', CH, 'evt_replay_1']]);
-  const before = orderRow(CH);
-
-  const again = await burst([['webhook', CH, 'evt_replay_1']]);
-  check('replaying a finished event answers duplicate ignored',
-        again[0].status === 200 && again[0].body === 'duplicate ignored',
-        'body=' + again[0].body);
-  const after = orderRow(CH);
-  check('…and the token, paid_at and expiry are all untouched',
-        after.token === before.token && after.paid_at === before.paid_at &&
-        after.expires_at === before.expires_at);
-}
-
-// ── 25. an event that arrives before its order is not thrown away ─────────
-{
-  freshDb([]);
-  const CH = 'pi_wh_early';
-
-  const early = await burst([['webhook', CH, 'evt_early_1']]);
-  check('an event with no order yet answers 500 so Stripe delivers it again',
-        early[0].status === 500, 'status=' + early[0].status);
-  check('…and it is NOT marked handled', eventRows().length === 0);
-
-  // …then /api/pay writes the order, and the retry lands.
-  seedPendingOrder(CH);
-  const late = await burst([['webhook', CH, 'evt_early_1']]);
-  check('once the order exists the retry grants normally',
-        late[0].status === 200 && late[0].body === 'ok', 'status=' + late[0].status);
-  check('…the order is paid', orderRow(CH).status === 'paid');
-}
-
-// ── 26. an orphan event is parked, never closed out on a guess ────────────
-// The earlier version decided, from the event's age alone, that the order was
-// never coming and recorded it as processed. Nothing in this code can know
-// that, and being wrong means the event is dead forever.
-{
-  freshDb([]);
-  const CH = 'pi_wh_orphan';
-  const a = await burst([['webhook', CH, 'evt_orphan_1', '5900', '7200']]);
-  check('an old orphan is still refused, not closed out on its age',
-        a[0].status === 500, 'status=' + a[0].status);
-  check('…it is NEVER recorded as processed', eventRows().length === 0);
-  let open = unresolvedRows();
-  check('…it is parked as unresolved instead', open.length === 1 && open[0].reason === 'no_order');
-  check('…with the payload kept so it can be replayed',
-        !!open[0].payload && String(open[0].payload).includes('evt_orphan_1'));
-
-  await burst([['webhook', CH, 'evt_orphan_1', '5900', '7200']]);
-  open = unresolvedRows();
-  check('…and a further delivery counts an attempt rather than duplicating the row',
-        open.length === 1 && Number(open[0].attempts) === 2, 'attempts=' + open[0].attempts);
-  check('…still open', !open[0].resolved_at);
-
-  // the order finally appears — the parked event must now be able to complete
-  seedPendingOrder(CH);
-  const done = await burst([['webhook', CH, 'evt_orphan_1', '5900', '7200']]);
-  check('once the order exists, the parked event completes for real',
-        done[0].status === 200 && done[0].body === 'ok', 'status=' + done[0].status);
-  check('…the order is paid', orderRow(CH).status === 'paid');
-  check('…and the unresolved row is closed', !!unresolvedRows()[0].resolved_at);
-}
-
-// ── 27. a wrong amount never entitles, and never retries ──────────────────
-{
-  freshDb([]);
-  const CH = 'pi_wh_amount';
-  seedPendingOrder(CH);
-  const res = await burst([['webhook', CH, 'evt_amount_1', '100']]);
-  check('a mismatched amount answers 200 (retrying cannot fix it)',
-        res[0].status === 200 && String(res[0].body).indexOf('not entitled') === 0,
-        'body=' + res[0].body);
-  check('…and grants nothing', orderRow(CH).status === 'pending' && !orderRow(CH).token);
-}
-
-
-// ── 28. a stalled request cannot land on top of a newer token ─────────────
-// The control is the WRITE, not a clock. This case stalls the first request at
-// the exact moment before it writes, lets the customer recover with a newer
-// code, waits past any plausible timeout, and only then lets the old request
-// finish its write.
-{
-  const phone = '0877000001';
-  freshDb([phone]);
-  const E164 = '66877000001';
-  await burst([['request', phone, '10.28.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const codeA = codeFor(E164);
-  const pubA = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-
-  // request A gets as far as accepting the code and reserving its token…
-  await burst([['verify-crash', phone, codeA, pubA]], { CAP: '20' });
-  check('the stalled request did reserve a token',
-        !!read((raw) => raw.prepare(`SELECT issued_token FROM otp_challenges WHERE public_id=?`).get(pubA)).issued_token);
-
-  // …and stays stalled well past any timeout anyone might have reached for.
-  ageConsumed(600);
-
-  // meanwhile the customer asks again and recovers normally
-  ageChallenges(70);
-  await burst([['request', phone, '10.28.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const codeB = codeFor(E164);
-  const pubB = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-  const good = await burst([['verify', phone, codeB, pubB]], { CAP: '20' });
-  check('the newer code issues a token', good[0].status === 200 && good[0].body.ok);
-  const live = read((raw) => raw.prepare(`SELECT id, token FROM payments WHERE phone=?`).get(phone));
-
-  // now the stalled request resumes, right at its write
-  const late = await burst([['apply-stalled', pubA, String(live.id), 'token-from-stalled-request']], { CAP: '20' });
-  check('the stalled write is refused even after ten minutes',
-        late[0] && late[0].applied === false, JSON.stringify(late[0]));
-  check('…and the token the customer is holding is untouched',
-        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token === live.token);
-  check('…which is the newer one, not the stalled one',
-        live.token !== 'token-from-stalled-request');
-}
-
-// ── 29. the same challenge cannot write its token twice ───────────────────
-{
-  const phone = '0877000002';
-  freshDb([phone]);
-  const E164 = '66877000002';
-  await burst([['request', phone, '10.29.0.1']], { CAP: '20', ...TEST_ENV, OTP_TEST_PHONES: E164 });
-  const code = codeFor(E164);
-  const pub = read((raw) => raw.prepare(`SELECT public_id FROM otp_challenges ORDER BY id DESC LIMIT 1`).get()).public_id;
-  const ok = await burst([['verify', phone, code, pub]], { CAP: '20' });
-  const live = read((raw) => raw.prepare(`SELECT id, token FROM payments WHERE phone=?`).get(phone));
-  check('the code issued a token', ok[0].status === 200 && live.token === ok[0].body.token);
-
-  const again = await burst([['apply-stalled', pub, String(live.id), 'second-write']], { CAP: '20' });
-  check('a second write from the same challenge is refused',
-        again[0] && again[0].applied === false, JSON.stringify(again[0]));
-  check('…and the token is unchanged',
-        read((raw) => raw.prepare(`SELECT token FROM payments WHERE phone=?`).get(phone)).token === live.token);
+  const token = 'old-token-' + phone;
+  const now = nowSeconds();
+  await (async () => {
+    const { raw } = openD1(DBFILE);
+    try {
+      raw.prepare(`UPDATE payments SET owner_user_id = ? WHERE token = ?`).run(owner, token);
+      raw.prepare(`INSERT INTO users(id) VALUES (?)`).run(owner);
+      const sessionToken = randomToken();
+      raw.prepare(`INSERT INTO member_sessions(token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`)
+        .run(await sha256Hash(sessionToken), owner, now, now + 3600);
+      globalThis.__concSessionCookie = `${SESSION_COOKIE}=${sessionToken}`;
+    } finally { raw.close(); }
+  })();
+  const cookie = globalThis.__concSessionCookie;
+
+  const authed = await burst(Array.from({ length: 8 }, () => ['check-access', token, cookie]));
+  check('8 simultaneous check-access calls, signed in as the real owner, all report ok',
+        authed.every(r => r.body && r.body.ok === true), JSON.stringify(authed.map(r => r.body)));
+
+  const unauthed = await burst(Array.from({ length: 8 }, () => ['check-access', token, '']));
+  check('8 simultaneous check-access calls with NO session all report refused — no race lets one through',
+        unauthed.every(r => !(r.body && r.body.ok === true)), JSON.stringify(unauthed.map(r => r.body)));
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed   (real SQLite file, ' +

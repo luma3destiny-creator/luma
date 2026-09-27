@@ -1,49 +1,26 @@
-// functions/api/member/link-request-otp.js — step 1 of linking an old,
-// pre-membership purchase to the caller's own signed-in account.
+// functions/api/member/link-request-otp.js — RETIRED.
 //
-// Requires an active member session (CSRF-checked like /api/auth/logout);
-// the account being linked to is always the caller's own -- there is no
-// field for any other account id. Sends a code to the phone on the order,
-// exactly like /api/request-otp, with the same privacy/throttle properties
-// (see functions/lib/purchase-link.mjs and functions/lib/otp.mjs).
-
-import { authOrigin, currentMember, sameOrigin } from '../../lib/member-session.mjs';
-import { requestLinkOtp } from '../../lib/purchase-link.mjs';
+// Step 1 of linking an old, pre-membership purchase to a signed-in member
+// account. Retired along with phone/OTP recovery: there is no real
+// prior-purchase data behind this rollout that still needs an account-link
+// path, so the whole legacy-linking flow is being removed rather than kept
+// dormant.
+//
+// This handler is now an unconditional 410: it never checks the caller's
+// session, never reads or writes an otp_challenges or payments row, and
+// never calls the SMS provider. It does not depend on any environment
+// variable to stay closed.
 
 export async function onRequestOptions() {
   return cors(null, 204);
 }
 
-export async function onRequestPost(context) {
-  const { request, env } = context;
-
-  const origin = authOrigin(env, request);
-  if (!origin) return json({ error: 'ระบบสมาชิกยังไม่พร้อมใช้งาน' }, 503);
-  if (!sameOrigin(request, origin)) return json({ error: 'คำขอไม่ถูกต้อง' }, 400);
-  if (!env.OTP_PEPPER) {
-    console.error('link-request-otp: OTP_PEPPER not configured — refusing');
-    return json({ error: 'ระบบไม่พร้อมใช้งานชั่วคราว' }, 503);
-  }
-
-  let member;
-  try {
-    member = await currentMember(env, request);
-  } catch (e) {
-    return json({ error: 'ระบบสมาชิกยังไม่พร้อมใช้งาน' }, 503);
-  }
-  if (!member) return json({ error: 'กรุณาเข้าสู่ระบบก่อน' }, 401);
-
-  let body;
-  try { body = await request.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
-
-  try {
-    const ip = request.headers && request.headers.get ? (request.headers.get('cf-connecting-ip') || '') : '';
-    const result = await requestLinkOtp(env, { phone: body && body.phone, ip, userId: member.id });
-    return json(result, result.ok ? 200 : (result.status || 400));
-  } catch (e) {
-    console.error('link-request-otp error:', e);
-    return json({ error: 'ระบบไม่พร้อมใช้งานชั่วคราว' }, 503);
-  }
+export async function onRequestPost() {
+  return json({
+    ok: false,
+    error: 'การเชื่อมสิทธิ์เดิมปิดใช้งานแล้ว กรุณาเข้าสู่ระบบด้วยบัญชี LINE หรือ Google',
+    code: 'LINK_PURCHASE_RETIRED'
+  }, 410);
 }
 
 function json(data, status = 200) {

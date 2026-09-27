@@ -93,25 +93,7 @@
       <button class="edit" type="button" id="profileEdit">แก้ไขข้อมูลเกิด</button>
     </div>
 
-    <section id="linkPurchase" style="margin-top:28px;border-top:1px solid #3e3b35;padding-top:20px">
-      <h2 style="font-size:17px;margin:0 0 8px">เชื่อมสิทธิ์เดิม</h2>
-      <p class="note">หากคุณเคยซื้อสิทธิ์ดูดวง LUMA ไว้ก่อนมีบัญชีสมาชิก กรอกเบอร์โทรที่ใช้ตอนซื้อด้านล่าง ระบบจะส่งรหัสยืนยัน (OTP) ไปที่เบอร์นั้น รหัสนี้ใช้ยืนยันตัวตนเพื่อเชื่อมสิทธิ์เดิมเข้ากับบัญชีนี้เท่านั้น และใช้ได้เพียงครั้งเดียวต่อรายการที่ซื้อไว้ — เชื่อมแล้วจะใช้สิทธิ์นี้ได้ทันทีทุกครั้งที่เข้าสู่ระบบด้วยบัญชีนี้ ไม่ต้องกรอกเบอร์อีก</p>
-      <p id="linkErr" role="alert" hidden style="color:#e08a8a;font-size:13px;margin:-4px 0 12px"></p>
-      <p id="linkMsg" role="status" hidden style="color:#9fd39f;font-size:13px;margin:-4px 0 12px"></p>
-
-      <div id="linkStep1">
-        <label for="linkPhone">เบอร์โทรที่ใช้ตอนซื้อ</label>
-        <input id="linkPhone" class="text-field" type="tel" inputmode="numeric" placeholder="0812345678" maxlength="10">
-        <button class="edit" type="button" id="linkRequestBtn" style="margin-top:10px">ส่งรหัสยืนยัน</button>
-      </div>
-
-      <div id="linkStep2" hidden>
-        <label for="linkCode">รหัสยืนยัน (OTP)</label>
-        <input id="linkCode" class="text-field" type="text" inputmode="numeric" maxlength="8" placeholder="กรอกรหัส 6 หลักจาก SMS">
-        <button class="save" type="button" id="linkConfirmBtn" style="margin-top:10px">ยืนยันและเชื่อมสิทธิ์</button>
-        <button class="edit" type="button" id="linkResendBtn" style="margin-top:6px">ส่งรหัสอีกครั้ง</button>
-      </div>
-    </section>
+    <p class="note" style="margin-top:28px;border-top:1px solid #3e3b35;padding-top:20px">สิทธิ์การใช้งาน Premium ผูกกับบัญชี LINE/Google ที่คุณใช้เข้าสู่ระบบบัญชีนี้เท่านั้น เข้าสู่ระบบด้วยบัญชีเดิมทุกครั้งเพื่อใช้สิทธิ์ต่อได้ทันที ไม่มีการกู้คืนสิทธิ์ด้วยเบอร์โทรหรือรหัส OTP อีกต่อไป</p>
 
     <button id="logout" class="logout" type="button">ออกจากระบบ</button>
   </section>
@@ -285,61 +267,6 @@ function showForm(profile) {
   profileForm.hidden = false; profileSummary.hidden = true;
   profileCancel.hidden = !profile;
 }
-// BEGIN link purchase
-const linkErr = document.getElementById('linkErr');
-const linkMsg = document.getElementById('linkMsg');
-const linkStep1 = document.getElementById('linkStep1');
-const linkStep2 = document.getElementById('linkStep2');
-const linkPhone = document.getElementById('linkPhone');
-const linkCode = document.getElementById('linkCode');
-const linkRequestBtn = document.getElementById('linkRequestBtn');
-const linkConfirmBtn = document.getElementById('linkConfirmBtn');
-const linkResendBtn = document.getElementById('linkResendBtn');
-let linkChallengeId = null;
-function linkShowErr(msg) { linkMsg.hidden = true; linkErr.hidden = false; linkErr.textContent = msg; }
-function linkShowMsg(msg) { linkErr.hidden = true; linkMsg.hidden = false; linkMsg.textContent = msg; }
-async function requestLink() {
-  const phone = linkPhone.value.trim();
-  if (!phone) { linkShowErr('กรุณากรอกเบอร์โทรที่ใช้ตอนซื้อ'); return; }
-  linkRequestBtn.disabled = true; linkResendBtn.disabled = true;
-  try {
-    const response = await fetch('/api/member/link-request-otp', {
-      method: 'POST', credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone })
-    });
-    const data = await response.json();
-    if (!response.ok || data.ok !== true) throw new Error((data && data.error) || 'send_failed');
-    linkChallengeId = data.challengeId;
-    // Same privacy-preserving response as request-otp.js/link-request-otp.js:
-    // this message is identical whether or not the number actually has an
-    // unlinked order, so it is shown as-is, never reworded into a stronger claim.
-    linkShowMsg(data.message || 'หากเบอร์นี้มีสิทธิ์ที่ยังไม่ผูกกับบัญชีใด ระบบได้ส่งรหัสยืนยันไปให้แล้ว');
-    linkStep1.hidden = true; linkStep2.hidden = false;
-    linkCode.value = ''; linkCode.focus();
-  } catch (err) { linkShowErr((err && err.message) || 'ส่งรหัสไม่สำเร็จ กรุณาลองใหม่'); }
-  finally { linkRequestBtn.disabled = false; linkResendBtn.disabled = false; }
-}
-linkRequestBtn.addEventListener('click', requestLink);
-linkResendBtn.addEventListener('click', requestLink);
-linkConfirmBtn.addEventListener('click', async () => {
-  const code = linkCode.value.trim();
-  if (!linkChallengeId || !/^\d{4,8}$/.test(code)) { linkShowErr('กรุณากรอกรหัสยืนยันให้ถูกต้อง'); return; }
-  linkConfirmBtn.disabled = true;
-  try {
-    const response = await fetch('/api/member/link-verify-otp', {
-      method: 'POST', credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phone: linkPhone.value.trim(), code, challengeId: linkChallengeId })
-    });
-    const data = await response.json();
-    if (!response.ok || data.ok !== true) throw new Error((data && data.error) || 'verify_failed');
-    linkShowMsg('เชื่อมสิทธิ์สำเร็จ! ใช้งานสิทธิ์นี้ได้ทันทีทุกครั้งที่เข้าสู่ระบบด้วยบัญชีนี้');
-    linkStep1.hidden = true; linkStep2.hidden = true;
-    linkPhone.value = ''; linkCode.value = ''; linkChallengeId = null;
-  } catch (err) { linkShowErr((err && err.message) || 'รหัสยืนยันไม่ถูกต้องหรือหมดอายุแล้ว'); }
-  finally { linkConfirmBtn.disabled = false; }
-});
-// END link purchase
 let currentProfile = null;
 async function loadProfile(isEdit) {
   initFormOptions();

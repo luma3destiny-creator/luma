@@ -1,49 +1,24 @@
-// functions/api/member/link-verify-otp.js — step 2 of linking: prove the
-// code, then attach the caller's OWN signed-in account (from the session,
-// never from the request body) to the newest unlinked paid order for that
-// phone. Never issues or rewrites a token; never changes expires_at.
-
-import { authOrigin, currentMember, sameOrigin } from '../../lib/member-session.mjs';
-import { confirmLinkOtp } from '../../lib/purchase-link.mjs';
+// functions/api/member/link-verify-otp.js — RETIRED.
+//
+// Step 2 of linking an old, pre-membership purchase to a signed-in member
+// account. Retired for the same reason as
+// functions/api/member/link-request-otp.js.
+//
+// This handler is now an unconditional 410: it never checks the caller's
+// session, never parses `phone`/`code`/`challengeId`, and never reads or
+// writes an otp_challenges or payments row. It does not depend on any
+// environment variable to stay closed.
 
 export async function onRequestOptions() {
   return cors(null, 204);
 }
 
-export async function onRequestPost(context) {
-  const { request, env } = context;
-
-  const origin = authOrigin(env, request);
-  if (!origin) return json({ ok: false, error: 'ระบบสมาชิกยังไม่พร้อมใช้งาน' }, 503);
-  if (!sameOrigin(request, origin)) return json({ ok: false, error: 'คำขอไม่ถูกต้อง' }, 400);
-  if (!env.OTP_PEPPER) {
-    console.error('link-verify-otp: OTP_PEPPER not configured — refusing');
-    return json({ ok: false, error: 'ระบบไม่พร้อมใช้งานชั่วคราว' }, 503);
-  }
-
-  let member;
-  try {
-    member = await currentMember(env, request);
-  } catch (e) {
-    return json({ ok: false, error: 'ระบบสมาชิกยังไม่พร้อมใช้งาน' }, 503);
-  }
-  if (!member) return json({ ok: false, error: 'กรุณาเข้าสู่ระบบก่อน' }, 401);
-
-  let body;
-  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }, 400); }
-
-  try {
-    const result = await confirmLinkOtp(env, {
-      userId: member.id,
-      phone: body && body.phone,
-      code: body && body.code,
-      challengeId: body && body.challengeId
-    });
-    return json(result, result.ok ? 200 : (result.status || 400));
-  } catch (e) {
-    console.error('link-verify-otp error:', e);
-    return json({ ok: false, error: 'ระบบไม่พร้อมใช้งานชั่วคราว' }, 503);
-  }
+export async function onRequestPost() {
+  return json({
+    ok: false,
+    error: 'การเชื่อมสิทธิ์เดิมปิดใช้งานแล้ว กรุณาเข้าสู่ระบบด้วยบัญชี LINE หรือ Google',
+    code: 'LINK_PURCHASE_RETIRED'
+  }, 410);
 }
 
 function json(data, status = 200) {
