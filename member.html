@@ -20,7 +20,19 @@
     p{line-height:1.8;color:#cac5ba}button{width:100%;padding:15px;border:1px solid transparent;border-radius:10px;font:inherit;font-weight:600;cursor:pointer;margin:6px 0}
     button:disabled{opacity:.5;cursor:wait}.line{background:#06c755;color:#fff}.google{background:#fff;color:#1f1f1f;border-color:#747775}
     .logout{background:transparent;border-color:#7d7057;color:#f8f4e9}a{color:#e7c98c}footer{font-size:13px;margin-top:28px}
-    #message{min-height:1.8em}button:focus-visible,a:focus-visible{outline:3px solid #ebc97d;outline-offset:4px}[hidden]{display:none!important}
+    #message{min-height:1.8em}button:focus-visible,a:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid #ebc97d;outline-offset:2px}[hidden]{display:none!important}
+    .note{font-size:13px;color:#a39d8f;background:#22263380;border-radius:10px;padding:10px 12px;margin:0 0 16px}
+    .field-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+    .field-row.full{grid-template-columns:1fr}
+    label{display:block;font-size:12.5px;color:#a39d8f;margin-bottom:4px}
+    select,input.text-field{width:100%;padding:11px;border-radius:8px;border:1px solid #3e3b35;background:#11131c;color:#f8f4e9;font:inherit}
+    .dmy-row,.hms-row{display:flex;gap:6px;align-items:center}.dmy-row select,.hms-row select{flex:1;min-width:0}
+    .colon{color:#a39d8f}
+    .edit{background:transparent;border-color:#7d7057;color:#f8f4e9}
+    .save{background:#dbc089;color:#1a1d28}
+    dl.summary{margin:0 0 18px;display:grid;grid-template-columns:auto 1fr;gap:8px 14px;font-size:15px}
+    dl.summary dt{color:#a39d8f}dl.summary dd{margin:0;text-align:right}
+    #profileErr{color:#e08a8a;font-size:13px;margin:-4px 0 12px}
   </style>
 </head>
 <body><main>
@@ -33,7 +45,42 @@
     <form method="post" action="/api/auth/google/start"><button class="google" type="submit">เข้าสู่ระบบด้วย Google</button></form>
   </section>
   <section id="account" hidden>
-    <p>คุณเข้าสู่ระบบแล้ว ส่วนโปรไฟล์ข้อมูลเกิดและประวัติรายงานกำลังเตรียมเปิดใช้งาน</p>
+    <p class="note">เราขอวัน เวลา และสถานที่เกิดของคุณ เพื่อใช้คำนวณผลดวงของคุณเท่านั้น ข้อมูลนี้ผูกกับบัญชีนี้ ไม่ใช่กับการชำระเงินใด ๆ คุณดูหรือแก้ไขได้ที่หน้านี้ทุกเมื่อ — อ่านเพิ่มเติมใน<a href="/privacy">นโยบายความเป็นส่วนตัว</a></p>
+    <p id="profileErr" role="alert" hidden></p>
+
+    <form id="profileForm" hidden>
+      <div class="field-row full">
+        <div>
+          <label>วัน เดือน ปีเกิด</label>
+          <div class="dmy-row"><select id="pDay" required></select><select id="pMonth" required></select><select id="pYear" required></select></div>
+        </div>
+      </div>
+      <div class="field-row full">
+        <div>
+          <label for="pHour">เวลาเกิด</label>
+          <div class="hms-row"><select id="pHour" required></select><span class="colon">:</span><select id="pMinute" required></select></div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div><label for="pPlace">สถานที่เกิด</label><input id="pPlace" class="text-field" placeholder="เช่น กรุงเทพมหานคร" required maxlength="200"></div>
+        <div><label for="pGender">เพศกำเนิด</label>
+          <select id="pGender" required><option value="m">ชาย</option><option value="f">หญิง</option></select>
+        </div>
+      </div>
+      <button class="save" type="submit" id="profileSubmit">บันทึกข้อมูลเกิด</button>
+      <button class="edit" type="button" id="profileCancel" hidden>ยกเลิก</button>
+    </form>
+
+    <div id="profileSummary" hidden>
+      <dl class="summary">
+        <dt>วันเกิด</dt><dd id="sumDate"></dd>
+        <dt>เวลาเกิด</dt><dd id="sumTime"></dd>
+        <dt>สถานที่เกิด</dt><dd id="sumPlace"></dd>
+        <dt>เพศกำเนิด</dt><dd id="sumGender"></dd>
+      </dl>
+      <button class="edit" type="button" id="profileEdit">แก้ไขข้อมูลเกิด</button>
+    </div>
+
     <button id="logout" class="logout" type="button">ออกจากระบบ</button>
   </section>
   <footer><a href="/privacy">ความเป็นส่วนตัว</a> · <a href="/app">กลับไปหน้า LUMA</a></footer>
@@ -43,6 +90,101 @@ const message = document.getElementById('message');
 const signIn = document.getElementById('signIn');
 const account = document.getElementById('account');
 const signOut = document.getElementById('logout');
+const profileForm = document.getElementById('profileForm');
+const profileSummary = document.getElementById('profileSummary');
+const profileErr = document.getElementById('profileErr');
+const profileSubmit = document.getElementById('profileSubmit');
+const profileCancel = document.getElementById('profileCancel');
+const MONTHS = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+const MONTHS_SHORT = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+const pad2 = n => (n < 10 ? '0' : '') + n;
+
+function daysInMonth(year, month) { return new Date(year, month, 0).getDate(); }
+function fillOptions(select, count, start, textFn, step = 1) {
+  select.innerHTML = '';
+  for (let i = 0; i < count; i++) {
+    const value = start + i * step;
+    const opt = document.createElement('option');
+    opt.value = value; opt.textContent = textFn ? textFn(value) : value;
+    select.appendChild(opt);
+  }
+}
+function initFormOptions() {
+  const day = document.getElementById('pDay'), month = document.getElementById('pMonth'), year = document.getElementById('pYear');
+  const hour = document.getElementById('pHour'), minute = document.getElementById('pMinute');
+  const currentYear = new Date().getFullYear();
+  fillOptions(day, 31, 1);
+  fillOptions(month, 12, 1, v => v + ' — ' + MONTHS[v - 1]);
+  fillOptions(year, currentYear - 1900 + 1, currentYear, v => v + ' (พ.ศ. ' + (v + 543) + ')', -1);
+  fillOptions(hour, 24, 0, pad2);
+  fillOptions(minute, 60, 0, pad2);
+  const syncDays = () => {
+    const y = parseInt(year.value, 10) || currentYear, m = parseInt(month.value, 10) || 1;
+    const max = daysInMonth(y, m), keep = Math.min(parseInt(day.value, 10) || 1, max);
+    fillOptions(day, max, 1); day.value = keep;
+  };
+  month.addEventListener('change', syncDays); year.addEventListener('change', syncDays);
+}
+function fillFormFrom(profile) {
+  fillOptions(document.getElementById('pDay'), daysInMonth(profile.birthYear, profile.birthMonth), 1);
+  document.getElementById('pDay').value = profile.birthDay;
+  document.getElementById('pMonth').value = profile.birthMonth;
+  document.getElementById('pYear').value = profile.birthYear;
+  document.getElementById('pHour').value = profile.birthHour;
+  document.getElementById('pMinute').value = profile.birthMinute;
+  document.getElementById('pPlace').value = profile.birthPlace;
+  document.getElementById('pGender').value = profile.gender;
+}
+function showSummary(profile) {
+  document.getElementById('sumDate').textContent = profile.birthDay + ' ' + MONTHS_SHORT[profile.birthMonth - 1] + ' ' + profile.birthYear;
+  document.getElementById('sumTime').textContent = pad2(profile.birthHour) + ':' + pad2(profile.birthMinute) + ' น.';
+  document.getElementById('sumPlace').textContent = profile.birthPlace;
+  document.getElementById('sumGender').textContent = profile.gender === 'm' ? 'ชาย' : 'หญิง';
+  profileSummary.hidden = false; profileForm.hidden = true; profileCancel.hidden = true;
+}
+function showForm(profile) {
+  if (profile) fillFormFrom(profile);
+  profileForm.hidden = false; profileSummary.hidden = true;
+  profileCancel.hidden = !profile;
+}
+let currentProfile = null;
+async function loadProfile() {
+  initFormOptions();
+  try {
+    const response = await fetch('/api/member/profile', { credentials: 'same-origin', cache: 'no-store' });
+    const data = await response.json();
+    if (!response.ok || data.ok !== true) throw new Error('unavailable');
+    currentProfile = data.profile;
+    if (currentProfile) showSummary(currentProfile); else showForm(null);
+  } catch { profileErr.hidden = false; profileErr.textContent = 'โหลดข้อมูลเกิดไม่สำเร็จ กรุณาลองใหม่'; }
+}
+document.getElementById('profileEdit').addEventListener('click', () => showForm(currentProfile));
+profileCancel.addEventListener('click', () => { if (currentProfile) showSummary(currentProfile); });
+profileForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  profileErr.hidden = true; profileSubmit.disabled = true;
+  try {
+    const body = {
+      birthYear: parseInt(document.getElementById('pYear').value, 10),
+      birthMonth: parseInt(document.getElementById('pMonth').value, 10),
+      birthDay: parseInt(document.getElementById('pDay').value, 10),
+      birthHour: parseInt(document.getElementById('pHour').value, 10),
+      birthMinute: parseInt(document.getElementById('pMinute').value, 10),
+      birthPlace: document.getElementById('pPlace').value.trim(),
+      gender: document.getElementById('pGender').value
+    };
+    const response = await fetch('/api/member/profile', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    });
+    const data = await response.json();
+    if (!response.ok || data.ok !== true) throw new Error(data.error || 'save_failed');
+    currentProfile = data.profile;
+    showSummary(currentProfile);
+  } catch (err) { profileErr.hidden = false; profileErr.textContent = (err && err.message) || 'บันทึกไม่สำเร็จ กรุณาลองใหม่'; }
+  finally { profileSubmit.disabled = false; }
+});
+
 async function refresh() {
   try {
     const response = await fetch('/api/auth/me', {credentials:'same-origin', cache:'no-store'});
@@ -54,6 +196,7 @@ async function refresh() {
     message.textContent = data.signedIn ? 'ยินดีต้อนรับสู่บัญชี LUMA' : result === 'failed'
       ? 'เข้าสู่ระบบไม่สำเร็จ กรุณาลองอีกครั้ง' : result === 'cancelled' ? 'คุณยกเลิกการเข้าสู่ระบบ' : 'ยินดีต้อนรับสู่ LUMA';
     history.replaceState(null, '', location.pathname);
+    if (data.signedIn) await loadProfile();
   } catch { signIn.hidden=true; account.hidden=true; message.textContent='ระบบสมาชิกยังไม่พร้อมใช้งาน กรุณากลับมาใหม่ภายหลัง'; }
 }
 signOut.addEventListener('click', async () => {
