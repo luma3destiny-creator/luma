@@ -1248,4 +1248,111 @@ if("1"===new URLSearchParams(location.search).get("dev")){
   };
 })();
 // END reading loader
-</script></body></html>
+</script><script>
+// Member profile pre-fill for the reading form (#birthForm). Fires once, after every
+// other page script has run. Anonymous visitors and any deploy with the membership
+// system unavailable see zero behavior change: every step below fails open into
+// "do nothing, leave the form exactly as it always was". This never calls
+// POST /api/member/profile — it only reads the saved profile to pre-fill the form;
+// edits made here while doing a reading never write back to the stored profile.
+(function () {
+  var form = document.getElementById('birthForm');
+  if (!form) return;
+
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function selectByValue(sel, value) {
+    if (!sel) return false;
+    for (var i = 0; i < sel.options.length; i++) {
+      if (String(sel.options[i].value) === String(value)) { sel.selectedIndex = i; return true; }
+    }
+    return false;
+  }
+
+  function addNoticeAfter(id, html, afterEl) {
+    if (!afterEl || document.getElementById(id)) return;
+    var p = document.createElement('p');
+    p.id = id;
+    p.style.cssText = 'font-size:12px;color:var(--ink-dim);text-align:center;margin:6px 0 0';
+    p.innerHTML = html;
+    afterEl.parentNode.insertBefore(p, afterEl.nextSibling);
+  }
+
+  function applyProfileToForm(profile) {
+    var nameEl = document.getElementById('bname');
+    var fullName = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
+    if (fullName && nameEl && !nameEl.value) nameEl.value = fullName;
+
+    var yearEl = document.getElementById('byear'), monthEl = document.getElementById('bmonth'), dayEl = document.getElementById('bday');
+    if (Number.isInteger(profile.birthYear)) selectByValue(yearEl, profile.birthYear);
+    if (Number.isInteger(profile.birthMonth)) selectByValue(monthEl, profile.birthMonth);
+    // Reuse this page's own day-list rebuild (keeps #bday's option count in sync with
+    // the selected month/year, e.g. Feb 29 on a leap year) instead of duplicating that
+    // logic here, then set the actual saved day once the list matches.
+    if (typeof window.Q === 'function') window.Q();
+    if (Number.isInteger(profile.birthDay)) selectByValue(dayEl, profile.birthDay);
+
+    var hourEl = document.getElementById('bhour'), minuteEl = document.getElementById('bminute');
+    if (Number.isInteger(profile.birthHour)) selectByValue(hourEl, profile.birthHour);
+    if (Number.isInteger(profile.birthMinute)) selectByValue(minuteEl, profile.birthMinute);
+    if (profile.timeUnknown && hourEl) {
+      addNoticeAfter(
+        'memberTimeUnknownNotice',
+        'โปรไฟล์ของคุณไม่ได้ระบุเวลาเกิดที่แน่นอน ระบบเติมเวลา 12:00 น. เป็นค่าประมาณให้ — แก้ไขเวลาด้านบนได้หากทราบเวลาจริง',
+        hourEl.closest('.field-row') || hourEl
+      );
+    }
+
+    var genderEl = document.getElementById('bgender');
+    if (profile.gender === 'm' || profile.gender === 'f') selectByValue(genderEl, profile.gender);
+
+    var placeEl = document.getElementById('bplace');
+    if (placeEl && typeof profile.birthPlace === 'string' && profile.birthPlace) {
+      var matched = selectByValue(placeEl, profile.birthPlace);
+      if (!matched) {
+        // The saved profile's place is free text (from /member) while this form needs an
+        // exact match to one of its lat/lng/tz-bearing options. Leave it unselected — the
+        // form's own required-field check will stop submission — rather than silently
+        // calculating the chart from the wrong location.
+        placeEl.selectedIndex = -1;
+        addNoticeAfter(
+          'memberPlaceMismatchNotice',
+          'สถานที่เกิดในโปรไฟล์ (' + escapeHtml(profile.birthPlace) + ') ไม่ตรงกับตัวเลือกด้านบน กรุณาเลือกสถานที่เกิดใหม่อีกครั้ง',
+          placeEl.closest('.field-row') || placeEl
+        );
+      }
+    }
+  }
+
+  function showIncompleteProfileNotice() {
+    if (document.getElementById('memberProfileMissingNotice')) return;
+    var p = document.createElement('p');
+    p.id = 'memberProfileMissingNotice';
+    p.style.cssText = 'font-size:13px;color:var(--ink-dim);text-align:center;margin:0 0 10px';
+    p.innerHTML = 'คุณยังไม่ได้กรอกข้อมูลเกิดในโปรไฟล์ <a href="/member" style="color:var(--gold)">ไปกรอกที่หน้าสมาชิก</a> หรือกรอกด้านล่างนี้เพื่อดูดวงครั้งนี้ได้เลย';
+    form.parentNode.insertBefore(p, form);
+  }
+
+  async function initMemberPrefill() {
+    try {
+      var meRes = await fetch('/api/auth/me', { credentials: 'same-origin', cache: 'no-store' });
+      if (!meRes.ok) return;
+      var me = await meRes.json();
+      if (!me || me.ok !== true || !me.signedIn) return; // anonymous, or membership disabled: untouched
+
+      var profRes = await fetch('/api/member/profile', { credentials: 'same-origin', cache: 'no-store' });
+      if (!profRes.ok) return;
+      var profData = await profRes.json();
+      if (!profData || profData.ok !== true) return;
+
+      if (!profData.profile) { showIncompleteProfileNotice(); return; }
+      applyProfileToForm(profData.profile);
+    } catch (e) { /* any network/API failure: leave the form exactly as an anonymous visitor sees it */ }
+  }
+
+  initMemberPrefill();
+})();
+</script>
+</body></html>
