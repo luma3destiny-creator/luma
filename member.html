@@ -4,7 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
-  <meta name="referrer" content="no-referrer">
+  <!-- same-origin, not no-referrer: a plain <meta name="referrer" content="no-referrer">
+       makes Chrome send Origin: "null" on this page's own POST-method form navigations
+       (start.js/callback.js check Origin against AUTH_ORIGIN), so LINE/Google login was
+       rejected with "invalid request" before reaching the provider. same-origin still
+       sends no Referer to LINE/Google (cross-origin), only to LUMA's own endpoints,
+       and does not relax the server-side Origin/CSRF check. -->
+  <meta name="referrer" content="same-origin">
   <title>บัญชีของฉัน · LUMA</title>
   <style>
     :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131c;color:#f8f4e9}
