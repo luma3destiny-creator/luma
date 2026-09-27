@@ -10,7 +10,7 @@ const origin = 'https://www.lumahoro.com';
 function fixture(t) {
   const db = new DatabaseSync(':memory:'); t.after(() => db.close());
   db.exec('PRAGMA foreign_keys=ON');
-  for (const name of ['011_membership_core.sql', '013_birth_profiles.sql']) {
+  for (const name of ['011_membership_core.sql', '013_birth_profiles.sql', '014_birth_profile_name_time_unknown.sql']) {
     db.exec(readFileSync(new URL('../../migrations/' + name, import.meta.url), 'utf8'));
   }
   const prep = (sql, args = []) => ({
@@ -88,7 +88,7 @@ test('save then read-back round-trips exactly, and no profile shows null before 
   const read = await (await getProfile({ env, request: request('/api/member/profile', { cookie }) })).json();
   assert.deepEqual(
     { ...read.profile, updatedAt: undefined },
-    { ...sample, updatedAt: undefined }
+    { ...sample, updatedAt: undefined, firstName: null, lastName: null, timeUnknown: false }
   );
 });
 
@@ -149,4 +149,79 @@ test('a future birthdate is rejected server-side, compared against today in Asia
   const today = { ...sample, birthYear: nowBkk.getUTCFullYear(), birthMonth: nowBkk.getUTCMonth() + 1, birthDay: nowBkk.getUTCDate() };
   const saved = await (await saveProfile({ env, request: request('/api/member/profile', { method: 'POST', cookie, body: today }) })).json();
   assert.equal(saved.ok, true);
+});
+
+test('a pre-existing row saved before this feature shipped reads back without error', async t => {
+  const { env, db } = fixture(t);
+  const cookie = await signIn(env, 'subject-a');
+  const member = db.prepare('SELECT id FROM users').get();
+  // Simulate a row written by the OLD insert (no first_name/last_name/time_unknown columns supplied).
+  db.prepare(`INSERT INTO birth_profiles
+    (user_id,birth_year,birth_month,birth_day,birth_hour,birth_minute,birth_place,gender,created_at,updated_at)
+    VALUES (?,1990,1,1,9,0,'ขอนแก่น','m',100,100)`).run(member.id);
+  const read = await (await getProfile({ env, request: request('/api/member/profile', { cookie }) })).json();
+  assert.equal(read.ok, true);
+  assert.equal(read.profile.firstName, null);
+  assert.equal(read.profile.lastName, null);
+  assert.equal(read.profile.timeUnknown, false);
+  assert.equal(read.profile.birthPlace, 'ขอนแก่น');
+});
+
+test('name is saved, read back, and can be edited; blank name is accepted as "not provided"', async t => {
+  const { env } = fixture(t);
+  const cookie = await signIn(env, 'subject-a');
+  const saved = await (await saveProfile({ env, request: request('/api/member/profile', { method: 'POST', cookie, body: { ...sample, firstName: 'สมชาย', lastName: 'ใจดี' } }) })).json();
+  assert.equal(saved.ok, true);
+  assert.equal(saved.profile.firstName, 'สมชาย');
+  assert.equal(saved.profile.lastName, 'ใจดี');
+  const edited = await (await saveProfile({ env, request: request('/api/member/profile', { method: 'POST', cookie, body: { ...sample, firstName: 'วิชัย', lastName: 'ใจดี' } }) })).json();
+  assert.equal(edited.profile.firstName, 'วิชัย');
+  // Blank/omitted name on a later save clears it back to "not provided", not an error.
+  const cleared = await (await saveProfile({ env, request: request('/api/member/profile', { method: 'POST', cookie, body: { ...sample, firstName: '  ', lastName: undefined } }) })).json();
+  assert.equal(cleared.ok, true);
+  assert.equal(cleared.profile.firstName, null);
+  assert.equal(cleared.profile.lastName, null);
+});
+
+test('an overlong or non-string name is rejected before any write', async t => {
+  const { env, db } = fixture(t);
+  const cookie = await signIn(env, 'subject-a');
+  for (const bad of [{ ...sample, firstName: 'ก'.repeat(101) }, { ...sample, lastName: 12345 }]) {
+    const response = await saveProfile({ env, request: request('/api/member/profile', { method: 'POST', cookie, body: bad }) });
+    assert.equal(response.status, 400);
+  }
+  assert.equal(db.prepare('SELECT count(*) AS n FROM birth_profiles').get().n, 0);
+});
+
+test('"don\'t remember birth time" forces 12:00 server-side and ignores any hour/minute sent by the browser', async t => {
+  const { env } = fixture(t);
+  const cookie = await signIn(env, 'subject-a');
+  const saved = await (await saveProfile({ env, request: request('/api/member/profile', { method: 'POST', cookie, body: { ...sample, timeUnknown: true, birthHour: 23, birthMinute: 59 } }) })).json();
+  assert.equal(saved.ok, true);
+  assert.equal(saved.profile.birthHour, 12);
+  assert.equal(saved.profile.birthMinute, 0);
+  assert.equal(saved.profile.timeUnknown, true);
+});
+
+test('timeUnknown status is stored separately from the time itself, so a real noon birth is distinguishable from an estimate', async t => {
+  const { env } = fixture(t);
+  const cookie = await signIn(env, 'subject-a');
+  const realNoon = await (await saveProfile({ env, request: request('/api/member/profile', { method: 'POST', cookie, body: { ...sample, birthHour: 12, birthMinute: 0, timeUnknown: false } }) })).json();
+  assert.equal(realNoon.profile.birthHour, 12);
+  assert.equal(realNoon.profile.timeUnknown, false);
+  const estimated = await (await saveProfile({ env, request: request('/api/member/profile', { method: 'POST', cookie, body: { ...sample, timeUnknown: true } }) })).json();
+  assert.equal(estimated.profile.birthHour, 12);
+  assert.equal(estimated.profile.timeUnknown, true);
+  // Turning the checkbox back off requires (and accepts) a real time again.
+  const unchecked = await (await saveProfile({ env, request: request('/api/member/profile', { method: 'POST', cookie, body: { ...sample, birthHour: 8, birthMinute: 15, timeUnknown: false } }) })).json();
+  assert.equal(unchecked.profile.birthHour, 8);
+  assert.equal(unchecked.profile.timeUnknown, false);
+});
+
+test('when timeUnknown is not set, a missing/invalid time is still rejected (checkbox does not silently rescue bad input)', async t => {
+  const { env, db } = fixture(t);
+  const cookie = await signIn(env, 'subject-a');
+  const response = await saveProfile({ env, request: request('/api/member/profile', { method: 'POST', cookie, body: { ...sample, birthHour: null, timeUnknown: false } }) });
+  assert.equal(response.status, 400);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM birth_profiles').get().n, 0);
 });

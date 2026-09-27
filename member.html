@@ -33,6 +33,9 @@
     dl.summary{margin:0 0 18px;display:grid;grid-template-columns:auto 1fr;gap:8px 14px;font-size:15px}
     dl.summary dt{color:#a39d8f}dl.summary dd{margin:0;text-align:right}
     #profileErr{color:#e08a8a;font-size:13px;margin:-4px 0 12px}
+    .checkbox-row{display:flex;align-items:center;gap:8px;font-size:13.5px;color:#cac5ba;margin-top:8px}
+    .checkbox-row input{width:auto;accent-color:#dbc089}
+    #timeUnknownNote{margin:8px 0 0}
   </style>
 </head>
 <body><main>
@@ -51,6 +54,12 @@
     <form id="profileForm" hidden>
       <div class="field-row full">
         <div>
+          <label>ชื่อ นามสกุล (สำหรับผลดวง)</label>
+          <div class="dmy-row"><input id="pFirstName" class="text-field" placeholder="ชื่อ" maxlength="100"><input id="pLastName" class="text-field" placeholder="นามสกุล" maxlength="100"></div>
+        </div>
+      </div>
+      <div class="field-row full">
+        <div>
           <label>วัน เดือน ปีเกิด</label>
           <div class="dmy-row"><select id="pDay" required></select><select id="pMonth" required></select><select id="pYear" required></select></div>
         </div>
@@ -59,6 +68,8 @@
         <div>
           <label for="pHour">เวลาเกิด</label>
           <div class="hms-row"><select id="pHour" required></select><span class="colon">:</span><select id="pMinute" required></select></div>
+          <label class="checkbox-row"><input type="checkbox" id="pTimeUnknown"> จำเวลาเกิดไม่ได้</label>
+          <p class="note" id="timeUnknownNote" hidden>ระบบจะใช้เวลา 12:00 น. เป็นค่าประมาณ</p>
         </div>
       </div>
       <div class="field-row">
@@ -73,6 +84,7 @@
 
     <div id="profileSummary" hidden>
       <dl class="summary">
+        <div id="sumNameRow" style="display:contents" hidden><dt>ชื่อ</dt><dd id="sumName"></dd></div>
         <dt>วันเกิด</dt><dd id="sumDate"></dd>
         <dt>เวลาเกิด</dt><dd id="sumTime"></dd>
         <dt>สถานที่เกิด</dt><dd id="sumPlace"></dd>
@@ -125,6 +137,13 @@ function initFormOptions() {
   };
   month.addEventListener('change', syncDays); year.addEventListener('change', syncDays);
 }
+function syncTimeUnknownUI() {
+  const checked = document.getElementById('pTimeUnknown').checked;
+  const hour = document.getElementById('pHour'), minute = document.getElementById('pMinute');
+  document.getElementById('timeUnknownNote').hidden = !checked;
+  hour.disabled = checked; minute.disabled = checked;
+  if (checked) { hour.value = 12; minute.value = 0; }
+}
 function fillFormFrom(profile) {
   fillOptions(document.getElementById('pDay'), daysInMonth(profile.birthYear, profile.birthMonth), 1);
   document.getElementById('pDay').value = profile.birthDay;
@@ -134,16 +153,31 @@ function fillFormFrom(profile) {
   document.getElementById('pMinute').value = profile.birthMinute;
   document.getElementById('pPlace').value = profile.birthPlace;
   document.getElementById('pGender').value = profile.gender;
+  document.getElementById('pFirstName').value = profile.firstName || '';
+  document.getElementById('pLastName').value = profile.lastName || '';
+  document.getElementById('pTimeUnknown').checked = !!profile.timeUnknown;
+  syncTimeUnknownUI();
 }
 function showSummary(profile) {
+  const fullName = [profile.firstName, profile.lastName].filter(Boolean).join(' ');
+  document.getElementById('sumNameRow').hidden = !fullName;
+  document.getElementById('sumName').textContent = fullName;
   document.getElementById('sumDate').textContent = profile.birthDay + ' ' + MONTHS_SHORT[profile.birthMonth - 1] + ' ' + profile.birthYear;
-  document.getElementById('sumTime').textContent = pad2(profile.birthHour) + ':' + pad2(profile.birthMinute) + ' น.';
+  document.getElementById('sumTime').textContent = profile.timeUnknown
+    ? '~12:00 น. (ไม่ทราบเวลาที่แน่นอน)'
+    : pad2(profile.birthHour) + ':' + pad2(profile.birthMinute) + ' น.';
   document.getElementById('sumPlace').textContent = profile.birthPlace;
   document.getElementById('sumGender').textContent = profile.gender === 'm' ? 'ชาย' : 'หญิง';
   profileSummary.hidden = false; profileForm.hidden = true; profileCancel.hidden = true;
 }
 function showForm(profile) {
   if (profile) fillFormFrom(profile);
+  else {
+    document.getElementById('pFirstName').value = '';
+    document.getElementById('pLastName').value = '';
+    document.getElementById('pTimeUnknown').checked = false;
+    syncTimeUnknownUI();
+  }
   profileForm.hidden = false; profileSummary.hidden = true;
   profileCancel.hidden = !profile;
 }
@@ -159,19 +193,24 @@ async function loadProfile() {
   } catch { profileErr.hidden = false; profileErr.textContent = 'โหลดข้อมูลเกิดไม่สำเร็จ กรุณาลองใหม่'; }
 }
 document.getElementById('profileEdit').addEventListener('click', () => showForm(currentProfile));
+document.getElementById('pTimeUnknown').addEventListener('change', syncTimeUnknownUI);
 profileCancel.addEventListener('click', () => { if (currentProfile) showSummary(currentProfile); });
 profileForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   profileErr.hidden = true; profileSubmit.disabled = true;
   try {
+    const timeUnknown = document.getElementById('pTimeUnknown').checked;
     const body = {
+      firstName: document.getElementById('pFirstName').value.trim(),
+      lastName: document.getElementById('pLastName').value.trim(),
       birthYear: parseInt(document.getElementById('pYear').value, 10),
       birthMonth: parseInt(document.getElementById('pMonth').value, 10),
       birthDay: parseInt(document.getElementById('pDay').value, 10),
-      birthHour: parseInt(document.getElementById('pHour').value, 10),
-      birthMinute: parseInt(document.getElementById('pMinute').value, 10),
+      birthHour: timeUnknown ? 12 : parseInt(document.getElementById('pHour').value, 10),
+      birthMinute: timeUnknown ? 0 : parseInt(document.getElementById('pMinute').value, 10),
       birthPlace: document.getElementById('pPlace').value.trim(),
-      gender: document.getElementById('pGender').value
+      gender: document.getElementById('pGender').value,
+      timeUnknown
     };
     const response = await fetch('/api/member/profile', {
       method: 'POST', credentials: 'same-origin',
